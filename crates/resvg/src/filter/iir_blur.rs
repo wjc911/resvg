@@ -46,20 +46,17 @@ struct BlurData {
 ///
 /// This method will allocate a buffer for intermediate computation.
 pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
-    // For very small images (< 16x16 = 256 pixels), the overhead of
-    // interleaving 4 channels into `Vec<[f64; 4]>` (4x more memory) isn't
-    // worth it. Fall back to the straightforward per-channel implementation.
-    if src.width < 16 || src.height < 16 {
-        apply_naive(sigma_x, sigma_y, src);
+    let pixel_count = (src.width as usize) * (src.height as usize);
+
+    // For large images, the interleaved 4-channel implementation has better
+    // cache locality and reduces 16 passes to 4. Use it as a cold early-return.
+    if pixel_count > 500_000 {
+        apply_interleaved(sigma_x, sigma_y, src);
         return;
     }
 
-    apply_optimized(sigma_x, sigma_y, src);
-}
-
-/// Straightforward per-channel implementation used as a fallback for small images.
-pub fn apply_naive(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
-    let buf_size = (src.width * src.height) as usize;
+    // Default hot path: original per-channel implementation.
+    let buf_size = pixel_count;
     let mut buf = vec![0.0; buf_size];
     let buf = &mut buf;
 
@@ -160,7 +157,8 @@ fn gen_coefficients(sigma: f64, steps: usize) -> (f64, f64) {
 }
 
 // ============================================================
-// Optimized implementation: all 4 channels interleaved, f64, tiled vertical
+// Optimized implementation (cold path for large images):
+// all 4 channels interleaved, f64, tiled vertical
 // ============================================================
 
 /// Tile width for the vertical pass of the IIR filter.
@@ -173,7 +171,9 @@ const IIR_VERT_TILE_W: usize = 32;
 /// dependency across pixels. The main win is reducing 16 passes to 4
 /// passes (4 channels simultaneously instead of separately).
 /// Uses f64 to stay bit-exact with the original implementation.
-fn apply_optimized(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
+#[cold]
+#[inline(never)]
+fn apply_interleaved(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let width = src.width as usize;
     let height = src.height as usize;
     let pixel_count = width * height;
