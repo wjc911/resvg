@@ -7,10 +7,13 @@
 //! Special focus on the 256-pixel threshold where the code switches from direct
 //! per-pixel computation to LUT-based lookup.
 //!
+//! Uses multithreading to execute independent benchmark configurations in parallel.
+//!
 //! Run with: cargo run -p resvg --release --example bench_component_transfer_comprehensive
 
 use rgb::RGBA8;
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use usvg::filter::{ComponentTransfer, Input, TransferFunction};
 
@@ -37,6 +40,45 @@ const IMAGE_SIZES: &[(u32, u32, &str)] = &[
     (512, 512, "512x512"),
     (1024, 1024, "1024x1024"),
     (2048, 2048, "2048x2048"),
+];
+
+// ---------------------------------------------------------------------------
+// Input pattern enum (Send + Sync friendly, replaces Box<dyn Fn>)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum InputPattern {
+    Zeros,
+    Opaque,
+    Gradient,
+    Random,
+}
+
+impl InputPattern {
+    fn label(self) -> &'static str {
+        match self {
+            InputPattern::Zeros => "zeros",
+            InputPattern::Opaque => "opaque",
+            InputPattern::Gradient => "gradient",
+            InputPattern::Random => "random",
+        }
+    }
+
+    fn generate(self, count: usize) -> Vec<RGBA8> {
+        match self {
+            InputPattern::Zeros => make_zeros(count),
+            InputPattern::Opaque => make_opaque(count),
+            InputPattern::Gradient => make_gradient(count),
+            InputPattern::Random => make_random(count),
+        }
+    }
+}
+
+const ALL_PATTERNS: &[InputPattern] = &[
+    InputPattern::Zeros,
+    InputPattern::Opaque,
+    InputPattern::Gradient,
+    InputPattern::Random,
 ];
 
 // ---------------------------------------------------------------------------
@@ -434,6 +476,7 @@ impl std::fmt::Display for PathChoice {
 }
 
 struct BenchResult {
+    order: usize,
     size_label: String,
     pixels: u32,
     transfer_type: String,
@@ -488,28 +531,23 @@ fn prod_path_label(fe: &ComponentTransfer, pixel_count: usize) -> String {
     }
 }
 
-fn run_bench(
-    fe: &ComponentTransfer,
-    width: u32,
-    height: u32,
-    size_label: &str,
-    transfer_type: &str,
-    input_pattern: &str,
-    base_image: &[RGBA8],
-) -> BenchResult {
-    let pixels = width * height;
+fn run_bench(config: &Config) -> BenchResult {
+    let pixels = config.width * config.height;
+    let pixel_count = pixels as usize;
+    let base_image = config.pattern.generate(pixel_count);
 
-    let naive_dur = bench_single(fe, base_image, PathChoice::Naive);
-    let lut_dur = bench_single(fe, base_image, PathChoice::Lut);
-    let prod_dur = bench_single(fe, base_image, PathChoice::Production);
+    let naive_dur = bench_single(&config.fe, &base_image, PathChoice::Naive);
+    let lut_dur = bench_single(&config.fe, &base_image, PathChoice::Lut);
+    let prod_dur = bench_single(&config.fe, &base_image, PathChoice::Production);
 
-    let path_used = prod_path_label(fe, pixels as usize);
+    let path_used = prod_path_label(&config.fe, pixel_count);
 
     BenchResult {
-        size_label: size_label.to_string(),
+        order: config.order,
+        size_label: config.size_label.clone(),
         pixels,
-        transfer_type: transfer_type.to_string(),
-        input_pattern: input_pattern.to_string(),
+        transfer_type: config.transfer_type.clone(),
+        input_pattern: config.pattern.label().to_string(),
         naive_us: naive_dur.as_nanos() as f64 / 1000.0,
         lut_us: lut_dur.as_nanos() as f64 / 1000.0,
         prod_us: prod_dur.as_nanos() as f64 / 1000.0,
@@ -574,13 +612,18 @@ fn transfer_functions() -> Vec<TransferFuncDef> {
     ]
 }
 
-fn input_patterns() -> Vec<(&'static str, Box<dyn Fn(usize) -> Vec<RGBA8>>)> {
-    vec![
-        ("zeros", Box::new(make_zeros)),
-        ("opaque", Box::new(make_opaque)),
-        ("gradient", Box::new(make_gradient)),
-        ("random", Box::new(make_random)),
-    ]
+// ---------------------------------------------------------------------------
+// Config: captures all parameters for one benchmark run
+// ---------------------------------------------------------------------------
+
+struct Config {
+    order: usize,
+    width: u32,
+    height: u32,
+    size_label: String,
+    transfer_type: String,
+    pattern: InputPattern,
+    fe: ComponentTransfer,
 }
 
 // ---------------------------------------------------------------------------
@@ -588,49 +631,56 @@ fn input_patterns() -> Vec<(&'static str, Box<dyn Fn(usize) -> Vec<RGBA8>>)> {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
     println!("feComponentTransfer Comprehensive Benchmark");
     println!("============================================");
     println!("Iterations per measurement: {ITERATIONS}");
     println!("Warmup iterations: {WARMUP}");
     println!("Threshold: pixels < 256 -> Direct, >= 256 -> LUT");
+    println!("Threads: {num_threads}");
     println!();
 
-    let mut results: Vec<BenchResult> = Vec::new();
-    let mut regressions: Vec<String> = Vec::new();
+    // ---------------------------------------------------------------------------
+    // Phase 1: Build all configurations upfront
+    // ---------------------------------------------------------------------------
 
+    let mut configs: Vec<Config> = Vec::new();
     let funcs = transfer_functions();
-    let patterns = input_patterns();
 
     // Part 1: Comprehensive sweep with "opaque" input pattern for all transfer types & sizes
-    println!("=== Part 1: All transfer types x all sizes (opaque input) ===");
-    println!();
-
     for func_def in &funcs {
         let fe = make_component_transfer_all(func_def.func.clone());
         for &(w, h, label) in IMAGE_SIZES {
-            let pixels = (w * h) as usize;
-            let base_image = make_opaque(pixels);
-            let r = run_bench(&fe, w, h, label, func_def.name, "opaque", &base_image);
-            results.push(r);
+            configs.push(Config {
+                order: configs.len(),
+                width: w,
+                height: h,
+                size_label: label.to_string(),
+                transfer_type: func_def.name.to_string(),
+                pattern: InputPattern::Opaque,
+                fe: fe.clone(),
+            });
         }
     }
 
     // Part 2: Mixed channel test (R=gamma, G=linear, B=table, A=identity)
-    println!("=== Part 2: Mixed channels (R=Gamma, G=Linear, B=Table, A=Identity) ===");
-    println!();
-
     let fe_mixed = make_component_transfer_mixed();
     for &(w, h, label) in IMAGE_SIZES {
-        let pixels = (w * h) as usize;
-        let base_image = make_opaque(pixels);
-        let r = run_bench(&fe_mixed, w, h, label, "Mixed", "opaque", &base_image);
-        results.push(r);
+        configs.push(Config {
+            order: configs.len(),
+            width: w,
+            height: h,
+            size_label: label.to_string(),
+            transfer_type: "Mixed".to_string(),
+            pattern: InputPattern::Opaque,
+            fe: fe_mixed.clone(),
+        });
     }
 
     // Part 3: Input pattern variations for Gamma(2.2) at key sizes
-    println!("=== Part 3: Input pattern variations for Gamma(2.2) ===");
-    println!();
-
     let fe_gamma = make_component_transfer_all(TransferFunction::Gamma {
         amplitude: 1.0,
         exponent: 2.2,
@@ -645,11 +695,16 @@ fn main() {
     ];
 
     for &(w, h, label) in key_sizes {
-        let pixels = (w * h) as usize;
-        for (pat_name, pat_fn) in &patterns {
-            let base_image = pat_fn(pixels);
-            let r = run_bench(&fe_gamma, w, h, label, "Gamma(2.2)", pat_name, &base_image);
-            results.push(r);
+        for &pat in ALL_PATTERNS {
+            configs.push(Config {
+                order: configs.len(),
+                width: w,
+                height: h,
+                size_label: label.to_string(),
+                transfer_type: "Gamma(2.2)".to_string(),
+                pattern: pat,
+                fe: fe_gamma.clone(),
+            });
         }
     }
 
@@ -660,13 +715,80 @@ fn main() {
     });
 
     for &(w, h, label) in key_sizes {
-        let pixels = (w * h) as usize;
-        for (pat_name, pat_fn) in &patterns {
-            let base_image = pat_fn(pixels);
-            let r = run_bench(&fe_linear, w, h, label, "Linear", pat_name, &base_image);
-            results.push(r);
+        for &pat in ALL_PATTERNS {
+            configs.push(Config {
+                order: configs.len(),
+                width: w,
+                height: h,
+                size_label: label.to_string(),
+                transfer_type: "Linear".to_string(),
+                pattern: pat,
+                fe: fe_linear.clone(),
+            });
         }
     }
+
+    let total = configs.len();
+    println!("Total configurations: {total}");
+    println!("Running benchmarks across {num_threads} threads...");
+    println!();
+
+    // ---------------------------------------------------------------------------
+    // Phase 2: Parallel execution
+    // ---------------------------------------------------------------------------
+
+    let progress = AtomicUsize::new(0);
+
+    // Split configs into chunks, one per thread
+    let chunk_size = (configs.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<&[Config]> = configs.chunks(chunk_size).collect();
+
+    let mut all_results: Vec<BenchResult> = Vec::with_capacity(total);
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk in &chunks {
+            let progress_ref = &progress;
+            let total_count = total;
+            let handle = s.spawn(move || {
+                let mut chunk_results = Vec::with_capacity(chunk.len());
+                for config in *chunk {
+                    let result = run_bench(config);
+                    chunk_results.push(result);
+                    let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 10 == 0 || done == total_count {
+                        eprint!("\r  Progress: {done}/{total_count}");
+                    }
+                }
+                chunk_results
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let chunk_results = handle.join().expect("thread panicked");
+            all_results.extend(chunk_results);
+        }
+    });
+
+    eprintln!();
+
+    // Sort by original order to preserve deterministic output
+    all_results.sort_by_key(|r| r.order);
+    let results = all_results;
+
+    // ---------------------------------------------------------------------------
+    // Phase 3: Display results (identical to original output)
+    // ---------------------------------------------------------------------------
+
+    let mut regressions: Vec<String> = Vec::new();
+
+    println!("=== Part 1: All transfer types x all sizes (opaque input) ===");
+    println!();
+    println!("=== Part 2: Mixed channels (R=Gamma, G=Linear, B=Table, A=Identity) ===");
+    println!();
+    println!("=== Part 3: Input pattern variations for Gamma(2.2) ===");
+    println!();
 
     // ---------------------------------------------------------------------------
     // Print results table
