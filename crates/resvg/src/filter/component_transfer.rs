@@ -29,6 +29,10 @@ fn build_lut(func: &TransferFunction) -> Lut {
 /// non-identity channel. This eliminates expensive per-pixel operations
 /// (especially `powf` in the Gamma case) by replacing them with a single
 /// table lookup per pixel per channel.
+///
+/// For very small images (fewer than 256 pixels), the LUT setup cost
+/// (up to 1024 `transfer_scalar()` calls) exceeds the per-pixel savings,
+/// so we fall back to direct per-pixel `transfer_scalar()` calls.
 pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
     let func_r = fe.func_r();
     let func_g = fe.func_g();
@@ -45,30 +49,52 @@ pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
         return;
     }
 
+    // For small images, the LUT setup cost (256 transfer_scalar() calls per
+    // active channel) exceeds the per-pixel savings. Fall back to direct
+    // per-pixel computation.
+    if src.data.len() < 256 {
+        for pixel in src.data {
+            if r_active {
+                pixel.r = transfer_scalar(func_r, pixel.r);
+            }
+            if g_active {
+                pixel.g = transfer_scalar(func_g, pixel.g);
+            }
+            if b_active {
+                pixel.b = transfer_scalar(func_b, pixel.b);
+            }
+            if a_active {
+                pixel.a = transfer_scalar(func_a, pixel.a);
+            }
+        }
+        return;
+    }
+
     // Pre-compute LUTs only for active channels.
     let lut_r = if r_active {
         build_lut(func_r)
     } else {
-        identity_lut()
+        IDENTITY_LUT
     };
     let lut_g = if g_active {
         build_lut(func_g)
     } else {
-        identity_lut()
+        IDENTITY_LUT
     };
     let lut_b = if b_active {
         build_lut(func_b)
     } else {
-        identity_lut()
+        IDENTITY_LUT
     };
     let lut_a = if a_active {
         build_lut(func_a)
     } else {
-        identity_lut()
+        IDENTITY_LUT
     };
 
-    // Apply LUTs. When all four channels are active we use a tight loop
-    // with four table lookups which is SIMD-friendly for auto-vectorization.
+    // Apply LUTs. Table lookups are gather operations that prevent
+    // auto-vectorization, but they still outperform per-pixel floating-point
+    // arithmetic (especially `powf`) for images with >= 256 pixels.
     // When only some channels are active, the identity LUT is a no-op in
     // terms of correctness (lut[x] == x for identity), so we can always
     // apply all four without branching in the hot loop.
@@ -80,17 +106,17 @@ pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
     }
 }
 
-/// Returns an identity LUT where lut[i] == i for all i.
-#[inline]
-fn identity_lut() -> Lut {
-    let mut lut: Lut = [0u8; 256];
+/// An identity LUT where lut[i] == i for all i.
+/// Computed at compile time for zero runtime cost.
+const IDENTITY_LUT: [u8; 256] = {
+    let mut lut = [0u8; 256];
     let mut i = 0u16;
-    while i <= 255 {
+    while i < 256 {
         lut[i as usize] = i as u8;
         i += 1;
     }
     lut
-}
+};
 
 /// Original naive implementation preserved verbatim for correctness testing.
 #[cfg(test)]
