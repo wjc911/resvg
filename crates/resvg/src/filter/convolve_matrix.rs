@@ -13,11 +13,23 @@ use usvg::filter::{ConvolveMatrix, EdgeMode};
 ///
 /// This method will allocate a copy of the `src` image as a back buffer.
 pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
-    apply_general(matrix, src);
+    let (rows, cols) = (matrix.matrix().rows(), matrix.matrix().columns());
+    if rows <= 1 && cols <= 1 {
+        // 1x1 kernel: the interior/edge split and pre-flipped kernel allocation
+        // is pure overhead; fall back to the simple path.
+        apply_naive(matrix, src);
+    } else if rows as u32 > src.height || cols as u32 > src.width {
+        // Kernel larger than image: interior region would be empty, so every
+        // pixel takes the edge path and the per-pixel in_interior branch is
+        // wasted overhead.
+        apply_naive(matrix, src);
+    } else {
+        apply_general(matrix, src);
+    }
 }
 
-/// The original naive implementation, preserved verbatim for correctness reference.
-#[allow(dead_code)]
+/// The original naive implementation, used as fallback for trivial cases (1x1 kernels,
+/// kernels larger than the image) where the optimized path has unnecessary overhead.
 fn apply_naive(matrix: &ConvolveMatrix, src: ImageRefMut) {
     fn bound(min: i32, val: i32, max: i32) -> i32 {
         core::cmp::max(min, core::cmp::min(max, val))
@@ -116,7 +128,12 @@ fn apply_naive(matrix: &ConvolveMatrix, src: ImageRefMut) {
     src.data.copy_from_slice(buf.data);
 }
 
-/// Optimized general convolution with interior/edge split and SIMD-friendly accumulation.
+/// Optimized general convolution that splits pixels into interior and edge regions.
+/// Interior pixels skip all boundary checks (the majority for typical kernel sizes),
+/// and the pre-flipped kernel avoids redundant reverse-indexing per pixel.
+/// Note: true SIMD auto-vectorization is still limited by the AoS pixel layout
+/// (interleaved R,G,B,A) and dynamic kernel sizes, but hoisting the preserve_alpha
+/// branch out of the inner loop removes one obstacle.
 fn apply_general(matrix: &ConvolveMatrix, src: ImageRefMut) {
     let width = src.width;
     let height = src.height;
@@ -153,7 +170,7 @@ fn apply_general(matrix: &ConvolveMatrix, src: ImageRefMut) {
         for x in 0..width {
             let in_p = src.data[(width * y + x) as usize];
 
-            // SIMD-friendly: use [f32; 4] array for RGBA accumulation.
+            // Use [f32; 4] array for RGBA accumulation.
             let mut accum = [0.0f32; 4];
 
             let in_interior = x >= interior_x_start
@@ -163,58 +180,110 @@ fn apply_general(matrix: &ConvolveMatrix, src: ImageRefMut) {
 
             if in_interior {
                 // Fast path: no boundary checks needed.
+                // The preserve_alpha branch is hoisted outside the inner loop
+                // so that each loop body has a fixed number of accumulations,
+                // giving the compiler a better chance to vectorize.
                 let base_x = x as i32 - target_x;
                 let base_y = y as i32 - target_y;
-                let mut ki = 0;
-                for oy in 0..rows {
-                    let row_offset = ((base_y + oy as i32) as u32 * width) as usize;
-                    for ox in 0..cols {
-                        let px_idx = row_offset + (base_x + ox as i32) as usize;
-                        let p = src.data[px_idx];
-                        let k = kernel[ki];
-                        ki += 1;
-
-                        // Use / 255.0 (not * inv_255) for bit-exact match with naive.
-                        accum[0] += (p.r as f32) / 255.0 * k;
-                        accum[1] += (p.g as f32) / 255.0 * k;
-                        accum[2] += (p.b as f32) / 255.0 * k;
-                        if !preserve_alpha {
+                if preserve_alpha {
+                    // Accumulate R, G, B only (3 channels).
+                    let mut ki = 0;
+                    for oy in 0..rows {
+                        let row_offset = ((base_y + oy as i32) as u32 * width) as usize;
+                        for ox in 0..cols {
+                            let px_idx = row_offset + (base_x + ox as i32) as usize;
+                            let p = src.data[px_idx];
+                            let k = kernel[ki];
+                            ki += 1;
+                            // Use / 255.0 (not * inv_255) for bit-exact match with naive.
+                            accum[0] += (p.r as f32) / 255.0 * k;
+                            accum[1] += (p.g as f32) / 255.0 * k;
+                            accum[2] += (p.b as f32) / 255.0 * k;
+                        }
+                    }
+                } else {
+                    // Accumulate all 4 channels (R, G, B, A).
+                    let mut ki = 0;
+                    for oy in 0..rows {
+                        let row_offset = ((base_y + oy as i32) as u32 * width) as usize;
+                        for ox in 0..cols {
+                            let px_idx = row_offset + (base_x + ox as i32) as usize;
+                            let p = src.data[px_idx];
+                            let k = kernel[ki];
+                            ki += 1;
+                            // Use / 255.0 (not * inv_255) for bit-exact match with naive.
+                            accum[0] += (p.r as f32) / 255.0 * k;
+                            accum[1] += (p.g as f32) / 255.0 * k;
+                            accum[2] += (p.b as f32) / 255.0 * k;
                             accum[3] += (p.a as f32) / 255.0 * k;
                         }
                     }
                 }
             } else {
                 // Edge path: handle boundary conditions.
-                let mut ki = 0;
-                for oy in 0..rows {
-                    for ox in 0..cols {
-                        let mut tx = x as i32 - target_x + ox as i32;
-                        let mut ty = y as i32 - target_y + oy as i32;
+                // Same preserve_alpha split to keep the branch out of the inner loop.
+                if preserve_alpha {
+                    let mut ki = 0;
+                    for oy in 0..rows {
+                        for ox in 0..cols {
+                            let mut tx = x as i32 - target_x + ox as i32;
+                            let mut ty = y as i32 - target_y + oy as i32;
 
-                        let k = kernel[ki];
-                        ki += 1;
+                            let k = kernel[ki];
+                            ki += 1;
 
-                        match matrix.edge_mode() {
-                            EdgeMode::None => {
-                                if tx < 0 || tx >= width_i || ty < 0 || ty >= height_i {
-                                    continue;
+                            match matrix.edge_mode() {
+                                EdgeMode::None => {
+                                    if tx < 0 || tx >= width_i || ty < 0 || ty >= height_i {
+                                        continue;
+                                    }
+                                }
+                                EdgeMode::Duplicate => {
+                                    tx = tx.max(0).min(width_i - 1);
+                                    ty = ty.max(0).min(height_i - 1);
+                                }
+                                EdgeMode::Wrap => {
+                                    tx = tx.rem_euclid(width_i);
+                                    ty = ty.rem_euclid(height_i);
                                 }
                             }
-                            EdgeMode::Duplicate => {
-                                tx = tx.max(0).min(width_i - 1);
-                                ty = ty.max(0).min(height_i - 1);
-                            }
-                            EdgeMode::Wrap => {
-                                tx = tx.rem_euclid(width_i);
-                                ty = ty.rem_euclid(height_i);
-                            }
-                        }
 
-                        let p = src.data[(ty as u32 * width + tx as u32) as usize];
-                        accum[0] += (p.r as f32) / 255.0 * k;
-                        accum[1] += (p.g as f32) / 255.0 * k;
-                        accum[2] += (p.b as f32) / 255.0 * k;
-                        if !preserve_alpha {
+                            let p = src.data[(ty as u32 * width + tx as u32) as usize];
+                            accum[0] += (p.r as f32) / 255.0 * k;
+                            accum[1] += (p.g as f32) / 255.0 * k;
+                            accum[2] += (p.b as f32) / 255.0 * k;
+                        }
+                    }
+                } else {
+                    let mut ki = 0;
+                    for oy in 0..rows {
+                        for ox in 0..cols {
+                            let mut tx = x as i32 - target_x + ox as i32;
+                            let mut ty = y as i32 - target_y + oy as i32;
+
+                            let k = kernel[ki];
+                            ki += 1;
+
+                            match matrix.edge_mode() {
+                                EdgeMode::None => {
+                                    if tx < 0 || tx >= width_i || ty < 0 || ty >= height_i {
+                                        continue;
+                                    }
+                                }
+                                EdgeMode::Duplicate => {
+                                    tx = tx.max(0).min(width_i - 1);
+                                    ty = ty.max(0).min(height_i - 1);
+                                }
+                                EdgeMode::Wrap => {
+                                    tx = tx.rem_euclid(width_i);
+                                    ty = ty.rem_euclid(height_i);
+                                }
+                            }
+
+                            let p = src.data[(ty as u32 * width + tx as u32) as usize];
+                            accum[0] += (p.r as f32) / 255.0 * k;
+                            accum[1] += (p.g as f32) / 255.0 * k;
+                            accum[2] += (p.b as f32) / 255.0 * k;
                             accum[3] += (p.a as f32) / 255.0 * k;
                         }
                     }
@@ -1063,5 +1132,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Helper to run `apply()` (the public dispatcher) and compare against `apply_naive()`.
+    fn verify_apply_matches_naive(matrix: &ConvolveMatrix, width: u32, height: u32, seed: u8) {
+        let data_naive = make_test_image(width, height, seed);
+        let data_apply = data_naive.clone();
+
+        let mut buf_naive = data_naive;
+        let mut buf_apply = data_apply;
+
+        apply_naive(matrix, ImageRefMut::new(width, height, &mut buf_naive));
+        apply(matrix, ImageRefMut::new(width, height, &mut buf_apply));
+
+        for (i, (n, a)) in buf_naive.iter().zip(buf_apply.iter()).enumerate() {
+            assert_eq!(
+                n, a,
+                "Mismatch at pixel {}: naive={:?} vs apply={:?}",
+                i, n, a
+            );
+        }
+    }
+
+    /// Test that apply() correctly dispatches 1x1 kernels through the naive fallback.
+    #[test]
+    fn test_apply_1x1_uses_naive_fallback() {
+        let m = make_convolve_matrix(1, 1, 0, 0, vec![2.0], 2.0, 0.0, EdgeMode::Duplicate, false);
+        verify_apply_matches_naive(&m, 8, 8, 44);
+    }
+
+    /// Test that apply() correctly dispatches kernels larger than the image
+    /// through the naive fallback.
+    #[test]
+    fn test_apply_oversized_kernel_uses_naive_fallback() {
+        // 5x5 kernel on a 4x4 image: cols (5) > width (4)
+        let m = make_convolve_matrix(
+            5,
+            5,
+            2,
+            2,
+            vec![1.0; 25],
+            25.0,
+            0.0,
+            EdgeMode::Duplicate,
+            false,
+        );
+        verify_apply_matches_naive(&m, 4, 4, 10);
+    }
+
+    /// Test that apply() correctly dispatches when only one kernel dimension
+    /// exceeds the image dimension.
+    #[test]
+    fn test_apply_oversized_kernel_one_dimension() {
+        // 3x7 kernel on a 8x5 image: rows (7) > height (5), cols (3) <= width (8)
+        let m = make_convolve_matrix(3, 7, 1, 3, vec![1.0; 21], 21.0, 0.0, EdgeMode::Wrap, false);
+        verify_apply_matches_naive(&m, 8, 5, 77);
     }
 }
