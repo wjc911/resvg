@@ -26,10 +26,38 @@ pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
     let mut backbuf = src.data.to_vec();
     let mut backbuf = ImageRefMut::new(src.width, src.height, &mut backbuf);
 
+    let pixel_count = (backbuf.width as usize) * (backbuf.height as usize);
+    let max_radius_vert = boxes_vert
+        .iter()
+        .map(|b| ((b - 1) / 2) as usize)
+        .max()
+        .unwrap_or(0);
+
+    if pixel_count > 250_000 && max_radius_vert >= 8 {
+        apply_tiled(&boxes_horz, &boxes_vert, &mut backbuf, &mut src);
+        return;
+    }
+
     for (box_size_horz, box_size_vert) in boxes_horz.iter().zip(boxes_vert.iter()) {
         let radius_horz = ((box_size_horz - 1) / 2) as usize;
         let radius_vert = ((box_size_vert - 1) / 2) as usize;
         box_blur_impl(radius_horz, radius_vert, &mut backbuf, &mut src);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn apply_tiled(
+    boxes_horz: &[i32; STEPS],
+    boxes_vert: &[i32; STEPS],
+    backbuf: &mut ImageRefMut,
+    frontbuf: &mut ImageRefMut,
+) {
+    for (box_size_horz, box_size_vert) in boxes_horz.iter().zip(boxes_vert.iter()) {
+        let radius_horz = ((box_size_horz - 1) / 2) as usize;
+        let radius_vert = ((box_size_vert - 1) / 2) as usize;
+        box_blur_vert_tiled(radius_vert, frontbuf, backbuf);
+        box_blur_horz_opt(radius_horz, backbuf, frontbuf);
     }
 }
 
@@ -77,18 +105,6 @@ fn box_blur_impl(
     backbuf: &mut ImageRefMut,
     frontbuf: &mut ImageRefMut,
 ) {
-    let pixel_count = backbuf.width as usize * backbuf.height as usize;
-
-    // For large images with significant vertical blur radius, the tiled
-    // implementation has better cache locality. Use it as an early-return
-    // cold path.
-    if pixel_count > 250_000 && blur_radius_vert >= 8 {
-        box_blur_vert_tiled(blur_radius_vert, frontbuf, backbuf);
-        box_blur_horz_opt(blur_radius_horz, backbuf, frontbuf);
-        return;
-    }
-
-    // Default hot path: original scalar implementation.
     box_blur_vert(blur_radius_vert, frontbuf, backbuf);
     box_blur_horz(blur_radius_horz, backbuf, frontbuf);
 }
