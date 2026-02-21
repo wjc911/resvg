@@ -8,7 +8,7 @@ use usvg::filter::MorphologyOperator;
 // For small kernels, the naive O(n*r^2) approach is faster than vHGW due to
 // lower overhead. This threshold is the maximum kernel area (columns * rows)
 // for which we use the naive path.
-const NAIVE_KERNEL_AREA_THRESHOLD: u32 = 32;
+const NAIVE_KERNEL_AREA_THRESHOLD: u32 = 9;
 
 /// Applies a morphology filter.
 ///
@@ -149,7 +149,9 @@ impl MorphOp for DilateOp {
 /// - `target`: offset of the target pixel within the window (floor(win/2))
 /// - `prefix`, `suffix`, `padded`: pre-allocated scratch buffers
 ///
-/// All buffers are resized as needed by the caller.
+/// The padded buffer is materialized explicitly (rather than computed
+/// virtually) because it produces branch-free inner loops that the
+/// compiler vectorizes more effectively.
 fn vhgw_1d<Op: MorphOp>(
     input: &[[u8; 4]],
     output: &mut [[u8; 4]],
@@ -251,7 +253,7 @@ fn apply_vhgw<Op: MorphOp>(columns: u32, rows: u32, src: ImageRefMut) {
     // Process columns in tiles for cache friendliness. Each tile extracts
     // TILE_WIDTH columns into a contiguous temporary, runs vHGW on each,
     // and writes results back.
-    const TILE_WIDTH: usize = 8;
+    const TILE_WIDTH: usize = 16;
     {
         let mut col_in = vec![[0u8; 4]; height];
         let mut col_out = vec![[0u8; 4]; height];
@@ -337,88 +339,461 @@ mod tests {
         data
     }
 
+    // ---------------------------------------------------------------
+    // Exhaustive brute-force: every (operator, rx, ry, w, h) combo
+    // ---------------------------------------------------------------
+
+    /// Test ALL combinations of operator × image size × radius.
+    /// This is the single most important correctness test.
     #[test]
-    fn vhgw_matches_naive_erode_various_radii() {
-        let data = make_random(50, 50, 12345);
-        for r in [1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 25.0] {
-            assert_bit_exact(MorphologyOperator::Erode, r, r, &data, 50, 50);
+    fn exhaustive_operator_radius_size_combinations() {
+        let operators = [MorphologyOperator::Erode, MorphologyOperator::Dilate];
+        let sizes: &[(u32, u32)] = &[
+            (1, 1), (1, 10), (10, 1), (2, 2), (3, 3), (4, 5),
+            (7, 7), (10, 10), (15, 20), (20, 15), (30, 30), (50, 50),
+            (100, 100),
+        ];
+        let radii: &[f32] = &[
+            0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0, 25.0, 50.0,
+        ];
+
+        let mut case_count = 0u32;
+        for &(w, h) in sizes {
+            let data = make_random(w, h, (w as u64) * 1000 + (h as u64));
+            for &op in &operators {
+                for &r in radii {
+                    assert_bit_exact(op, r, r, &data, w, h);
+                    case_count += 1;
+                }
+            }
+        }
+        eprintln!("exhaustive symmetric: {} cases passed", case_count);
+    }
+
+    /// Asymmetric radii: rx != ry for every combo.
+    #[test]
+    fn exhaustive_asymmetric_radii() {
+        let operators = [MorphologyOperator::Erode, MorphologyOperator::Dilate];
+        let sizes: &[(u32, u32)] = &[
+            (1, 1), (3, 7), (7, 3), (10, 20), (20, 10), (30, 30), (50, 50),
+        ];
+        let rx_values: &[f32] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0];
+        let ry_values: &[f32] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0];
+
+        let mut case_count = 0u32;
+        for &(w, h) in sizes {
+            let data = make_random(w, h, (w as u64) * 7777 + (h as u64));
+            for &op in &operators {
+                for &rx in rx_values {
+                    for &ry in ry_values {
+                        if rx == ry { continue; } // symmetric already covered
+                        assert_bit_exact(op, rx, ry, &data, w, h);
+                        case_count += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("exhaustive asymmetric: {} cases passed", case_count);
+    }
+
+    // ---------------------------------------------------------------
+    // Specific edge-case patterns
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn constant_images() {
+        // All zeros
+        for &(w, h) in &[(1,1), (5,5), (20,20), (50,50)] {
+            let data = vec![RGBA8 { r: 0, g: 0, b: 0, a: 0 }; (w * h) as usize];
+            for r in [1.0, 5.0, 15.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
+        }
+        // All 255
+        for &(w, h) in &[(1,1), (5,5), (20,20), (50,50)] {
+            let data = vec![RGBA8 { r: 255, g: 255, b: 255, a: 255 }; (w * h) as usize];
+            for r in [1.0, 5.0, 15.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
         }
     }
 
     #[test]
-    fn vhgw_matches_naive_dilate_various_radii() {
-        let data = make_random(50, 50, 67890);
-        for r in [1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 25.0] {
-            assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, 50, 50);
+    fn single_bright_pixel_center() {
+        // One bright pixel in the center of black image — dilate should spread it
+        for &(w, h) in &[(5,5), (11,11), (21,21), (50,50)] {
+            let mut data = vec![RGBA8 { r: 0, g: 0, b: 0, a: 0 }; (w * h) as usize];
+            let cx = w / 2;
+            let cy = h / 2;
+            data[(cy * w + cx) as usize] = RGBA8 { r: 255, g: 128, b: 64, a: 200 };
+            for r in [1.0, 2.0, 3.0, 5.0, 10.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
         }
     }
 
     #[test]
-    fn vhgw_matches_naive_asymmetric_radii() {
-        let data = make_random(40, 30, 11111);
-        assert_bit_exact(MorphologyOperator::Erode, 1.0, 10.0, &data, 40, 30);
-        assert_bit_exact(MorphologyOperator::Erode, 10.0, 1.0, &data, 40, 30);
-        assert_bit_exact(MorphologyOperator::Dilate, 1.0, 10.0, &data, 40, 30);
-        assert_bit_exact(MorphologyOperator::Dilate, 10.0, 1.0, &data, 40, 30);
-        assert_bit_exact(MorphologyOperator::Erode, 3.0, 7.0, &data, 40, 30);
-        assert_bit_exact(MorphologyOperator::Dilate, 5.0, 2.0, &data, 40, 30);
+    fn single_dark_pixel_center() {
+        // One dark pixel in the center of white image — erode should spread it
+        for &(w, h) in &[(5,5), (11,11), (21,21), (50,50)] {
+            let mut data = vec![RGBA8 { r: 255, g: 255, b: 255, a: 255 }; (w * h) as usize];
+            let cx = w / 2;
+            let cy = h / 2;
+            data[(cy * w + cx) as usize] = RGBA8 { r: 0, g: 30, b: 10, a: 50 };
+            for r in [1.0, 2.0, 3.0, 5.0, 10.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
+        }
     }
 
     #[test]
-    fn vhgw_matches_naive_all_zeros() {
-        let data = vec![RGBA8 { r: 0, g: 0, b: 0, a: 0 }; 20 * 20];
-        assert_bit_exact(MorphologyOperator::Erode, 5.0, 5.0, &data, 20, 20);
-        assert_bit_exact(MorphologyOperator::Dilate, 5.0, 5.0, &data, 20, 20);
+    fn checkerboard_pattern() {
+        for &(w, h) in &[(8,8), (15,15), (30,30), (50,50)] {
+            let mut data = Vec::with_capacity((w * h) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    if (x + y) % 2 == 0 {
+                        data.push(RGBA8 { r: 255, g: 255, b: 255, a: 255 });
+                    } else {
+                        data.push(RGBA8 { r: 0, g: 0, b: 0, a: 0 });
+                    }
+                }
+            }
+            for r in [1.0, 2.0, 3.0, 5.0, 10.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
+        }
     }
 
     #[test]
-    fn vhgw_matches_naive_all_255() {
-        let data = vec![RGBA8 { r: 255, g: 255, b: 255, a: 255 }; 20 * 20];
-        assert_bit_exact(MorphologyOperator::Erode, 5.0, 5.0, &data, 20, 20);
-        assert_bit_exact(MorphologyOperator::Dilate, 5.0, 5.0, &data, 20, 20);
+    fn horizontal_stripes() {
+        let w = 40u32;
+        let h = 40u32;
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            let v = if y % 4 < 2 { 255u8 } else { 0u8 };
+            for _ in 0..w {
+                data.push(RGBA8 { r: v, g: v, b: v, a: v });
+            }
+        }
+        for r in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0] {
+            assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+            assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+        }
     }
 
     #[test]
-    fn vhgw_matches_naive_gradient() {
-        let data = make_gradient(30, 30);
-        assert_bit_exact(MorphologyOperator::Erode, 4.0, 4.0, &data, 30, 30);
-        assert_bit_exact(MorphologyOperator::Dilate, 4.0, 4.0, &data, 30, 30);
+    fn vertical_stripes() {
+        let w = 40u32;
+        let h = 40u32;
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for _ in 0..h {
+            for x in 0..w {
+                let v = if x % 4 < 2 { 255u8 } else { 0u8 };
+                data.push(RGBA8 { r: v, g: v, b: v, a: v });
+            }
+        }
+        for r in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0] {
+            assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+            assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+        }
     }
 
     #[test]
-    fn vhgw_matches_naive_thin_images() {
-        // 1×N
-        let data = make_random(1, 30, 22222);
-        assert_bit_exact(MorphologyOperator::Erode, 5.0, 5.0, &data, 1, 30);
-        assert_bit_exact(MorphologyOperator::Dilate, 5.0, 5.0, &data, 1, 30);
-
-        // N×1
-        let data = make_random(30, 1, 33333);
-        assert_bit_exact(MorphologyOperator::Erode, 5.0, 5.0, &data, 30, 1);
-        assert_bit_exact(MorphologyOperator::Dilate, 5.0, 5.0, &data, 30, 1);
+    fn gradient_images() {
+        for &(w, h) in &[(10,10), (30,30), (50,50), (100,100)] {
+            let data = make_gradient(w, h);
+            for r in [1.0, 3.0, 5.0, 10.0, 15.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
+        }
     }
 
     #[test]
-    fn vhgw_matches_naive_radius_larger_than_dimension() {
-        let data = make_random(10, 8, 44444);
-        assert_bit_exact(MorphologyOperator::Erode, 20.0, 20.0, &data, 10, 8);
-        assert_bit_exact(MorphologyOperator::Dilate, 20.0, 20.0, &data, 10, 8);
+    fn radius_larger_than_every_dimension() {
+        // radius so large the window gets clamped to image size
+        for &(w, h) in &[(1,1), (2,3), (3,2), (5,5), (10,8), (8,10)] {
+            let data = make_random(w, h, (w as u64) * 9999 + (h as u64));
+            for r in [50.0, 100.0, 500.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
+        }
     }
 
     #[test]
-    fn vhgw_matches_naive_fractional_radii() {
-        let data = make_random(25, 25, 55555);
-        assert_bit_exact(MorphologyOperator::Erode, 0.5, 0.5, &data, 25, 25);
-        assert_bit_exact(MorphologyOperator::Dilate, 0.5, 0.5, &data, 25, 25);
-        assert_bit_exact(MorphologyOperator::Erode, 2.3, 4.7, &data, 25, 25);
-        assert_bit_exact(MorphologyOperator::Dilate, 1.1, 3.9, &data, 25, 25);
+    fn multiple_random_seeds() {
+        // Same geometry, different random data to catch data-dependent bugs
+        for seed in 0..20u64 {
+            let data = make_random(30, 30, seed * 13579);
+            assert_bit_exact(MorphologyOperator::Erode, 5.0, 5.0, &data, 30, 30);
+            assert_bit_exact(MorphologyOperator::Dilate, 5.0, 5.0, &data, 30, 30);
+            assert_bit_exact(MorphologyOperator::Erode, 3.0, 7.0, &data, 30, 30);
+            assert_bit_exact(MorphologyOperator::Dilate, 7.0, 3.0, &data, 30, 30);
+        }
     }
 
     #[test]
-    fn vhgw_matches_naive_small_image() {
-        let data = make_random(3, 3, 66666);
-        assert_bit_exact(MorphologyOperator::Erode, 2.0, 2.0, &data, 3, 3);
-        assert_bit_exact(MorphologyOperator::Dilate, 2.0, 2.0, &data, 3, 3);
+    fn non_square_images_various() {
+        let shapes: &[(u32, u32)] = &[
+            (1, 100), (100, 1), (2, 50), (50, 2), (3, 100), (100, 3),
+            (7, 50), (50, 7), (13, 37), (37, 13), (100, 200), (200, 100),
+        ];
+        for &(w, h) in shapes {
+            let data = make_random(w, h, (w as u64) * 31 + (h as u64) * 37);
+            for r in [1.0, 3.0, 5.0, 10.0] {
+                assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+                assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            }
+        }
     }
 
+    #[test]
+    fn premultiplied_alpha_edge_cases() {
+        // Semi-transparent pixels with premultiplied alpha
+        let w = 20u32;
+        let h = 20u32;
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for i in 0..(w * h) {
+            let a = (i % 256) as u8;
+            // premultiplied: r,g,b <= a
+            let r = a / 2;
+            let g = a / 3;
+            let b = a / 4;
+            data.push(RGBA8 { r, g, b, a });
+        }
+        for r in [1.0, 2.0, 5.0, 10.0] {
+            assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+            assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+        }
+    }
+
+    #[test]
+    fn corners_and_edges() {
+        // Bright pixels only at corners and edges
+        let w = 30u32;
+        let h = 30u32;
+        let mut data = vec![RGBA8 { r: 0, g: 0, b: 0, a: 0 }; (w * h) as usize];
+        // Four corners
+        data[0] = RGBA8 { r: 255, g: 0, b: 0, a: 255 };
+        data[(w - 1) as usize] = RGBA8 { r: 0, g: 255, b: 0, a: 255 };
+        data[((h - 1) * w) as usize] = RGBA8 { r: 0, g: 0, b: 255, a: 255 };
+        data[((h - 1) * w + w - 1) as usize] = RGBA8 { r: 255, g: 255, b: 0, a: 255 };
+        // Center of each edge
+        data[(w / 2) as usize] = RGBA8 { r: 128, g: 128, b: 128, a: 128 };
+        data[((h - 1) * w + w / 2) as usize] = RGBA8 { r: 128, g: 128, b: 128, a: 128 };
+        data[((h / 2) * w) as usize] = RGBA8 { r: 128, g: 128, b: 128, a: 128 };
+        data[((h / 2) * w + w - 1) as usize] = RGBA8 { r: 128, g: 128, b: 128, a: 128 };
+        for r in [1.0, 2.0, 5.0, 10.0, 15.0] {
+            assert_bit_exact(MorphologyOperator::Erode, r, r, &data, w, h);
+            assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, w, h);
+            // asymmetric too
+            assert_bit_exact(MorphologyOperator::Erode, r, 1.0, &data, w, h);
+            assert_bit_exact(MorphologyOperator::Dilate, 1.0, r, &data, w, h);
+        }
+    }
+
+    #[test]
+    fn larger_image_random() {
+        // 200×200 with various radii — catches issues that only appear at scale
+        let data = make_random(200, 200, 424242);
+        for r in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0] {
+            assert_bit_exact(MorphologyOperator::Erode, r, r, &data, 200, 200);
+            assert_bit_exact(MorphologyOperator::Dilate, r, r, &data, 200, 200);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Benchmark: naive vs vHGW, side-by-side comparison
+    // ---------------------------------------------------------------
+
+    /// Profile horizontal and vertical passes separately
+    fn profile_vhgw_passes(data: &[RGBA8], w: u32, h: u32, radius: f32, iterations: u32) -> (std::time::Duration, std::time::Duration) {
+        use std::time::Instant;
+        use std::hint::black_box;
+
+        let columns = std::cmp::min(radius.ceil() as u32 * 2, w);
+        let rows = std::cmp::min(radius.ceil() as u32 * 2, h);
+        let width = w as usize;
+        let height = h as usize;
+        let target_x = (columns as f32 / 2.0).floor() as usize;
+        let target_y = (rows as f32 / 2.0).floor() as usize;
+        let win_x = columns as usize;
+        let win_y = rows as usize;
+
+        let mut total_horz = std::time::Duration::ZERO;
+        let mut total_vert = std::time::Duration::ZERO;
+
+        for _ in 0..iterations {
+            let pixel_count = width * height;
+            let mut buf = vec![[0u8; 4]; pixel_count];
+            let max_dim = width.max(height);
+            let max_win = win_x.max(win_y);
+            let max_padded = max_dim + 2 * max_win;
+            let mut prefix = Vec::with_capacity(max_padded);
+            let mut suffix = Vec::with_capacity(max_padded);
+            let mut padded_buf = Vec::with_capacity(max_padded);
+
+            // Convert to [u8;4]
+            for i in 0..pixel_count {
+                let p = data[i];
+                buf[i] = [p.r, p.g, p.b, p.a];
+            }
+
+            // Horizontal pass
+            let start = Instant::now();
+            {
+                let mut row_out = vec![[0u8; 4]; width];
+                for y in 0..height {
+                    let row_start = y * width;
+                    vhgw_1d::<ErodeOp>(
+                        black_box(&buf[row_start..row_start + width]),
+                        &mut row_out,
+                        win_x, target_x,
+                        &mut prefix, &mut suffix, &mut padded_buf,
+                    );
+                    buf[row_start..row_start + width].copy_from_slice(&row_out);
+                }
+            }
+            total_horz += start.elapsed();
+
+            // Vertical pass
+            let start = Instant::now();
+            {
+                let mut col_in = vec![[0u8; 4]; height];
+                let mut col_out = vec![[0u8; 4]; height];
+                let mut x = 0;
+                while x < width {
+                    let tile_end = (x + 8).min(width);
+                    for col in x..tile_end {
+                        for y in 0..height {
+                            col_in[y] = buf[y * width + col];
+                        }
+                        vhgw_1d::<ErodeOp>(
+                            black_box(&col_in), &mut col_out,
+                            win_y, target_y,
+                            &mut prefix, &mut suffix, &mut padded_buf,
+                        );
+                        // write back to buf (just to keep consistent)
+                        for y in 0..height {
+                            buf[y * width + col] = col_out[y];
+                        }
+                    }
+                    x = tile_end;
+                }
+            }
+            total_vert += start.elapsed();
+        }
+        (total_horz / iterations, total_vert / iterations)
+    }
+
+    #[test]
+    fn benchmark_naive_vs_vhgw() {
+        use std::time::Instant;
+        use std::hint::black_box;
+
+        let w = 500u32;
+        let h = 500u32;
+        let data = make_random(w, h, 99999);
+        let iterations = 5;
+
+        eprintln!();
+        eprintln!("  === Benchmark: naive vs vHGW on {}x{} image ({} iterations) ===", w, h, iterations);
+        eprintln!();
+        eprintln!("  {:>8} {:>10} {:>10} {:>8}", "radius", "naive", "vHGW", "speedup");
+        eprintln!("  {}", "-".repeat(42));
+
+        for radius in [2.0f32, 3.0, 5.0, 10.0, 20.0, 50.0] {
+            let mut total_naive = std::time::Duration::ZERO;
+            for _ in 0..iterations {
+                let mut d = data.clone();
+                let start = Instant::now();
+                run_naive(
+                    black_box(MorphologyOperator::Erode),
+                    black_box(radius), black_box(radius),
+                    black_box(&mut d), w, h,
+                );
+                total_naive += start.elapsed();
+            }
+            let avg_naive = total_naive / iterations;
+
+            let mut total_vhgw = std::time::Duration::ZERO;
+            for _ in 0..iterations {
+                let mut d = data.clone();
+                let start = Instant::now();
+                run_vhgw(
+                    black_box(MorphologyOperator::Erode),
+                    black_box(radius), black_box(radius),
+                    black_box(&mut d), w, h,
+                );
+                total_vhgw += start.elapsed();
+            }
+            let avg_vhgw = total_vhgw / iterations;
+
+            let speedup = avg_naive.as_secs_f64() / avg_vhgw.as_secs_f64();
+            eprintln!(
+                "  {:>8.1} {:>10.2?} {:>10.2?} {:>7.1}x",
+                radius, avg_naive, avg_vhgw, speedup,
+            );
+        }
+
+        // Dilate
+        eprintln!();
+        eprintln!("  Dilate operator:");
+        for radius in [5.0f32, 20.0, 50.0] {
+            let mut total_naive = std::time::Duration::ZERO;
+            for _ in 0..iterations {
+                let mut d = data.clone();
+                let start = Instant::now();
+                run_naive(
+                    black_box(MorphologyOperator::Dilate),
+                    black_box(radius), black_box(radius),
+                    black_box(&mut d), w, h,
+                );
+                total_naive += start.elapsed();
+            }
+            let avg_naive = total_naive / iterations;
+
+            let mut total_vhgw = std::time::Duration::ZERO;
+            for _ in 0..iterations {
+                let mut d = data.clone();
+                let start = Instant::now();
+                run_vhgw(
+                    black_box(MorphologyOperator::Dilate),
+                    black_box(radius), black_box(radius),
+                    black_box(&mut d), w, h,
+                );
+                total_vhgw += start.elapsed();
+            }
+            let avg_vhgw = total_vhgw / iterations;
+
+            let speedup = avg_naive.as_secs_f64() / avg_vhgw.as_secs_f64();
+            eprintln!(
+                "  {:>8.1} {:>10.2?} {:>10.2?} {:>7.1}x",
+                radius, avg_naive, avg_vhgw, speedup,
+            );
+        }
+
+        // Per-pass profiling
+        eprintln!();
+        eprintln!("  === Per-pass profiling (erode) ===");
+        eprintln!("  {:>8} {:>10} {:>10} {:>8}", "radius", "horz", "vert", "vert%");
+        eprintln!("  {}", "-".repeat(42));
+        for radius in [2.0f32, 5.0, 10.0, 20.0, 50.0] {
+            let (horz, vert) = profile_vhgw_passes(&data, w, h, radius, iterations);
+            let total = horz + vert;
+            let vert_pct = vert.as_secs_f64() / total.as_secs_f64() * 100.0;
+            eprintln!(
+                "  {:>8.1} {:>10.2?} {:>10.2?} {:>7.1}%",
+                radius, horz, vert, vert_pct,
+            );
+        }
+        eprintln!();
+    }
 }
