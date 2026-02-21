@@ -185,7 +185,7 @@ fn bench_one(
         let mut data = base_data.to_vec();
         let src = ImageRefMut::new(w, h, &mut data);
         let start = Instant::now();
-        morphology::apply_naive(operator, columns, rows, src);
+        morphology::apply_naive_pub(operator, columns, rows, src);
         naive_times.push(start.elapsed());
         std::hint::black_box(&data);
     }
