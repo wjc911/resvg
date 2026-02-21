@@ -9,25 +9,24 @@ use usvg::filter::ColorMatrixKind as ColorMatrix;
 ///
 /// Input image pixels should have an **unpremultiplied alpha**.
 ///
-/// For the full 4x5 `Matrix` variant the row-major matrix is transposed into
-/// five column vectors of `[f32; 4]` so that LLVM can auto-vectorize the
-/// per-pixel matrix multiply into packed SIMD instructions.
-///
-/// The `Saturate`, `HueRotate`, and `LuminanceToAlpha` variants use compact
-/// specialised loops that the compiler already handles well.
+/// All variants use straightforward row-major scalar loops that LLVM
+/// auto-vectorizes across multiple pixels into packed SIMD instructions.
 pub fn apply(matrix: &ColorMatrix, src: ImageRefMut) {
     match matrix {
         ColorMatrix::Matrix(m) => {
-            // Transpose the 4x5 row-major matrix into 5 column vectors of length 4.
-            // Row-major layout: row i = m[i*5 .. i*5+5]
-            // Column j holds [m[0*5+j], m[1*5+j], m[2*5+j], m[3*5+j]]
-            let col0 = [m[0], m[5], m[10], m[15]]; // R column
-            let col1 = [m[1], m[6], m[11], m[16]]; // G column
-            let col2 = [m[2], m[7], m[12], m[17]]; // B column
-            let col3 = [m[3], m[8], m[13], m[18]]; // A column
-            let col4 = [m[4], m[9], m[14], m[19]]; // bias column
+            for pixel in src.data {
+                let (r, g, b, a) = to_normalized_components(*pixel);
 
-            apply_matrix_cols(src, &col0, &col1, &col2, &col3, &col4);
+                let new_r = r * m[0] + g * m[1] + b * m[2] + a * m[3] + m[4];
+                let new_g = r * m[5] + g * m[6] + b * m[7] + a * m[8] + m[9];
+                let new_b = r * m[10] + g * m[11] + b * m[12] + a * m[13] + m[14];
+                let new_a = r * m[15] + g * m[16] + b * m[17] + a * m[18] + m[19];
+
+                pixel.r = from_normalized(new_r);
+                pixel.g = from_normalized(new_g);
+                pixel.b = from_normalized(new_b);
+                pixel.a = from_normalized(new_a);
+            }
         }
         ColorMatrix::Saturate(v) => {
             let v = v.get().max(0.0);
@@ -98,53 +97,7 @@ pub fn apply(matrix: &ColorMatrix, src: ImageRefMut) {
     }
 }
 
-/// Optimised full 4x5 matrix apply using column-major `[f32; 4]` vectors.
-///
-/// The matrix is expressed as 5 column vectors (col0..col4), each `[f32; 4]`.
-/// For each pixel the accumulation order matches the naive row-major order:
-///   `out[i] = ((((col0[i]*r) + (col1[i]*g)) + (col2[i]*b)) + (col3[i]*a)) + col4[i]`
-///
-/// This exact left-to-right order guarantees bit-exact results with the
-/// original scalar implementation while allowing LLVM to auto-vectorize the
-/// 4-wide operations into packed SIMD instructions (all 4 lanes execute the
-/// same sequence of operations on independent data).
-#[inline(never)]
-fn apply_matrix_cols(
-    src: ImageRefMut,
-    col0: &[f32; 4],
-    col1: &[f32; 4],
-    col2: &[f32; 4],
-    col3: &[f32; 4],
-    col4: &[f32; 4],
-) {
-    for pixel in src.data {
-        let r = pixel.r as f32 / 255.0;
-        let g = pixel.g as f32 / 255.0;
-        let b = pixel.b as f32 / 255.0;
-        let a = pixel.a as f32 / 255.0;
-
-        // Accumulate in the exact same left-to-right order as the naive
-        // implementation: r*coeff + g*coeff + b*coeff + a*coeff + bias.
-        // The `[f32; 4]` indexing with a fixed 0..4 range lets LLVM
-        // auto-vectorize all 4 lanes into packed SIMD ops.
-        let mut out = [0.0_f32; 4];
-        for i in 0..4 {
-            out[i] = col0[i] * r;
-            out[i] += col1[i] * g;
-            out[i] += col2[i] * b;
-            out[i] += col3[i] * a;
-            out[i] += col4[i];
-        }
-
-        pixel.r = from_normalized(out[0]);
-        pixel.g = from_normalized(out[1]);
-        pixel.b = from_normalized(out[2]);
-        pixel.a = from_normalized(out[3]);
-    }
-}
-
-/// Verbatim copy of the original naive implementation, preserved for
-/// correctness testing and benchmarking.
+/// Copy of the apply function preserved for correctness testing.
 #[cfg(test)]
 pub fn apply_naive(matrix: &ColorMatrix, src: ImageRefMut) {
     match matrix {
