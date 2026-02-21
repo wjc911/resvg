@@ -21,6 +21,13 @@ const STEPS: usize = 5;
 ///
 /// This method will allocate a copy of the `src` image as a back buffer.
 pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
+    // For very small images, tiling overhead for the vertical pass provides no
+    // benefit. Fall back to the straightforward scalar implementation.
+    if src.width < 16 || src.height < 16 {
+        apply_naive(sigma_x, sigma_y, src);
+        return;
+    }
+
     let boxes_horz = create_box_gauss(sigma_x as f32);
     let boxes_vert = create_box_gauss(sigma_y as f32);
     let mut backbuf = src.data.to_vec();
@@ -33,8 +40,7 @@ pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
     }
 }
 
-/// Preserved original entry point (verbatim, no changes).
-#[allow(dead_code)]
+/// Straightforward scalar implementation used as a fallback for small images.
 pub fn apply_naive(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
     let boxes_horz = create_box_gauss(sigma_x as f32);
     let boxes_vert = create_box_gauss(sigma_y as f32);
@@ -103,8 +109,11 @@ fn box_blur_impl(
     box_blur_horz_opt(blur_radius_horz, backbuf, frontbuf);
 }
 
-/// Optimized vertical box blur: processes columns in tiles for cache locality,
-/// uses `[i32; 4]` accumulators for SIMD auto-vectorization.
+/// Optimized vertical box blur: processes columns in tiles for cache locality.
+/// The `[i32; 4]` accumulator enables 4-channel processing within a single
+/// iteration (potential 128-bit SIMD for the 4-channel arithmetic), but the
+/// loop-carried dependency on `val` prevents across-pixel vectorization.
+/// The main benefit is the cache-friendly tiled vertical pass.
 fn box_blur_vert_tiled(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
     if blur_radius == 0 {
         frontbuf.data.copy_from_slice(backbuf.data);
@@ -134,7 +143,7 @@ fn box_blur_vert_tiled(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut
     }
 }
 
-/// Process a single column with [i32; 4] accumulators for auto-vectorization.
+/// Process a single column with `[i32; 4]` accumulators for 4-channel processing.
 #[inline]
 fn box_blur_vert_single_col(
     blur_radius: usize,
@@ -249,7 +258,9 @@ fn box_blur_vert_single_col(
     }
 }
 
-/// Optimized horizontal box blur with [i32; 4] accumulators.
+/// Optimized horizontal box blur with `[i32; 4]` accumulators.
+/// The 4-channel arithmetic can use 128-bit SIMD within a pixel, but the
+/// loop-carried dependency on `val` prevents across-pixel vectorization.
 fn box_blur_horz_opt(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
     if blur_radius == 0 {
         frontbuf.data.copy_from_slice(backbuf.data);

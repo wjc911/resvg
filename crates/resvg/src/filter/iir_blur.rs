@@ -46,11 +46,18 @@ struct BlurData {
 ///
 /// This method will allocate a buffer for intermediate computation.
 pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
+    // For very small images (< 16x16 = 256 pixels), the overhead of
+    // interleaving 4 channels into `Vec<[f64; 4]>` (4x more memory) isn't
+    // worth it. Fall back to the straightforward per-channel implementation.
+    if src.width < 16 || src.height < 16 {
+        apply_naive(sigma_x, sigma_y, src);
+        return;
+    }
+
     apply_optimized(sigma_x, sigma_y, src);
 }
 
-/// Preserved original entry point (verbatim, no changes).
-#[allow(dead_code)]
+/// Straightforward per-channel implementation used as a fallback for small images.
 pub fn apply_naive(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let buf_size = (src.width * src.height) as usize;
     let mut buf = vec![0.0; buf_size];
@@ -160,9 +167,12 @@ fn gen_coefficients(sigma: f64, steps: usize) -> (f64, f64) {
 const IIR_VERT_TILE_W: usize = 32;
 
 /// Optimized IIR blur that processes all 4 RGBA channels simultaneously
-/// using `[f64; 4]` arrays for SIMD auto-vectorization, and tiles the
-/// vertical pass for better cache locality. Uses f64 to stay bit-exact
-/// with the original implementation.
+/// using `[f64; 4]` arrays and tiles the vertical pass for better cache
+/// locality. The `[f64; 4]` interleaved processing enables 4-channel SIMD
+/// within a pixel (potential AVX 256-bit), but IIR has strict serial
+/// dependency across pixels. The main win is reducing 16 passes to 4
+/// passes (4 channels simultaneously instead of separately).
+/// Uses f64 to stay bit-exact with the original implementation.
 fn apply_optimized(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let width = src.width as usize;
     let height = src.height as usize;
