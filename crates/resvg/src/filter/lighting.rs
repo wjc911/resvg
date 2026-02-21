@@ -272,6 +272,8 @@ fn apply(
 
 /// Original naive implementation used for small images (below `OPTIMIZED_THRESHOLD` pixels).
 /// Also used in test builds for bit-exact verification against the optimized path.
+#[cold]
+#[inline(never)]
 fn apply_naive(
     light_source: LightSource,
     surface_scale: f32,
@@ -365,6 +367,7 @@ fn apply_naive(
 /// - Uses a 3-row sliding window, reusing two rows per iteration (only reads one new row)
 /// - Pre-computes spot light direction once instead of per-pixel
 /// - Processes pixels in row-major order with sequential memory access
+#[inline(never)]
 fn apply_optimized(
     light_source: LightSource,
     surface_scale: f32,
