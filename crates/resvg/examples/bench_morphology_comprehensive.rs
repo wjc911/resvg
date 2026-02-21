@@ -3,17 +3,34 @@
 // Tests naive O(n*r^2) vs production apply() (which dispatches to naive or vHGW)
 // across all combinations of image sizes, radii, operators, and input patterns.
 //
+// Uses multithreading via std::thread::scope for faster execution.
+//
 // Run with:
 //   cargo run --release --example bench_morphology_comprehensive
 
 use resvg::filter::morphology;
 use resvg::filter::ImageRefMut;
 use rgb::RGBA8;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use usvg::filter::MorphologyOperator;
 
 // Mirror the threshold from morphology.rs
 const NAIVE_KERNEL_AREA_THRESHOLD: u32 = 9;
+
+// ---------------------------------------------------------------------------
+// Configuration struct for one benchmark run
+// ---------------------------------------------------------------------------
+
+struct Config {
+    order: usize,
+    size: u32,
+    rx: f32,
+    ry: f32,
+    operator: MorphologyOperator,
+    pattern: &'static str,
+    iterations: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Image generators
@@ -129,6 +146,7 @@ fn iterations_for_config(size: u32, rx: f32, ry: f32) -> usize {
 // ---------------------------------------------------------------------------
 
 struct BenchResult {
+    order: usize,
     image_size: String,
     radius: String,
     operator: String,
@@ -203,6 +221,7 @@ fn bench_one(
     };
 
     BenchResult {
+        order: 0, // caller will set this
         image_size: format!("{}x{}", w, h),
         radius: format!("rx={:.1},ry={:.1}", rx, ry),
         operator: op_name.to_string(),
@@ -233,9 +252,39 @@ fn main() {
     ];
 
     let operators = [MorphologyOperator::Erode, MorphologyOperator::Dilate];
-    let patterns: &[&str] = &["opaque", "gradient", "sparse50"];
+    let patterns: &[&'static str] = &["opaque", "gradient", "sparse50"];
 
-    let total_configs = sizes.len() * radii.len() * operators.len() * patterns.len();
+    // -----------------------------------------------------------------------
+    // Build all configurations upfront
+    // -----------------------------------------------------------------------
+    let mut configs: Vec<Config> = Vec::new();
+    let mut order = 0usize;
+
+    for &size in sizes {
+        for &(rx, ry, _radius_label) in radii {
+            let iters = iterations_for_config(size, rx, ry);
+            for &op in &operators {
+                for &pattern in patterns {
+                    configs.push(Config {
+                        order,
+                        size,
+                        rx,
+                        ry,
+                        operator: op,
+                        pattern,
+                        iterations: iters,
+                    });
+                    order += 1;
+                }
+            }
+        }
+    }
+
+    let total_configs = configs.len();
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
     eprintln!(
         "Running {} configurations ({} sizes x {} radii x {} operators x {} patterns)",
         total_configs,
@@ -244,58 +293,94 @@ fn main() {
         operators.len(),
         patterns.len()
     );
-    eprintln!("This may take a while...\n");
+    eprintln!(
+        "Using {} threads for parallel execution\n",
+        num_threads
+    );
 
-    // Print CSV header
+    // -----------------------------------------------------------------------
+    // Execute benchmarks in parallel using std::thread::scope
+    // -----------------------------------------------------------------------
+    let progress = AtomicUsize::new(0);
+
+    // Split configs into chunks, one per thread
+    let chunk_size = (configs.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<&[Config]> = configs.chunks(chunk_size).collect();
+
+    let mut all_results: Vec<BenchResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let progress = &progress;
+                s.spawn(move || {
+                    let mut results = Vec::with_capacity(chunk.len());
+                    for cfg in chunk {
+                        let w = cfg.size;
+                        let h = cfg.size;
+
+                        let base_data = match cfg.pattern {
+                            "opaque" => make_opaque(w, h, 42),
+                            "gradient" => make_gradient(w, h),
+                            "sparse50" => make_sparse50(w, h, 99),
+                            _ => unreachable!(),
+                        };
+
+                        let mut result = bench_one(
+                            w,
+                            h,
+                            cfg.rx,
+                            cfg.ry,
+                            cfg.operator,
+                            &base_data,
+                            cfg.pattern,
+                            cfg.iterations,
+                        );
+                        result.order = cfg.order;
+                        results.push(result);
+
+                        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % 50 == 0 || done == total_configs {
+                            eprintln!("  Progress: {}/{}", done, total_configs);
+                        }
+                    }
+                    results
+                })
+            })
+            .collect();
+
+        // Collect results from all threads
+        let mut merged = Vec::with_capacity(total_configs);
+        for handle in handles {
+            merged.extend(handle.join().unwrap());
+        }
+        merged
+    });
+
+    // Sort results back into original order
+    all_results.sort_by_key(|r| r.order);
+
+    // -----------------------------------------------------------------------
+    // Print results table
+    // -----------------------------------------------------------------------
     println!(
         "{:<12} | {:<28} | {:<8} | {:<10} | {:>6} | {:>10} | {:>10} | {:>8} | {:<10}",
         "Image Size", "Radius", "Operator", "Pattern", "Path", "Naive (us)", "Prod (us)", "Speedup", "Status"
     );
     println!("{}", "-".repeat(120));
 
-    let mut all_results: Vec<BenchResult> = Vec::new();
-    let mut done = 0usize;
-
-    for &size in sizes {
-        let w = size;
-        let h = size;
-
-        for &(rx, ry, _radius_label) in radii {
-            let iters = iterations_for_config(size, rx, ry);
-
-            for &op in &operators {
-                for &pattern in patterns {
-                    let base_data = match pattern {
-                        "opaque" => make_opaque(w, h, 42),
-                        "gradient" => make_gradient(w, h),
-                        "sparse50" => make_sparse50(w, h, 99),
-                        _ => unreachable!(),
-                    };
-
-                    let result = bench_one(w, h, rx, ry, op, &base_data, pattern, iters);
-
-                    println!(
-                        "{:<12} | {:<28} | {:<8} | {:<10} | {:>6} | {:>10.2} | {:>10.2} | {:>7.2}x | {:<10}",
-                        result.image_size,
-                        result.radius,
-                        result.operator,
-                        result.input_pattern,
-                        result.path,
-                        result.naive_us,
-                        result.prod_us,
-                        result.speedup,
-                        result.status,
-                    );
-
-                    all_results.push(result);
-                    done += 1;
-
-                    if done % 50 == 0 {
-                        eprintln!("  Progress: {}/{}", done, total_configs);
-                    }
-                }
-            }
-        }
+    for result in &all_results {
+        println!(
+            "{:<12} | {:<28} | {:<8} | {:<10} | {:>6} | {:>10.2} | {:>10.2} | {:>7.2}x | {:<10}",
+            result.image_size,
+            result.radius,
+            result.operator,
+            result.input_pattern,
+            result.path,
+            result.naive_us,
+            result.prod_us,
+            result.speedup,
+            result.status,
+        );
     }
 
     // ---------------------------------------------------------------------------
