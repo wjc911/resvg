@@ -254,6 +254,7 @@ fn specular_lighting_naive(
 /// Note: this is *not* a SIMD or data-layout optimisation. The pixel data is
 /// still in AoS `RGBA8` order and the per-pixel branching prevents
 /// auto-vectorisation.
+#[inline(never)]
 fn specular_lighting_optimized(
     fe: &SpecularLighting,
     light_source: LightSource,
