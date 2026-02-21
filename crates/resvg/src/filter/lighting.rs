@@ -228,10 +228,12 @@ pub fn specular_lighting(
     );
 }
 
-/// Threshold (in total pixel count) below which we use the naive implementation.
-/// For small images, the overhead of row-buffer allocation and setup in the optimized
-/// path is not worthwhile.
-const OPTIMIZED_THRESHOLD: u32 = 64 * 64;
+/// Threshold (in total pixel count) at which the optimized path breaks even with naive.
+/// Benchmark shows 64x64 distant light is 0.93x (slower on the optimized path),
+/// while 256x256 is clearly faster. 128x128 is a conservative crossover point.
+#[cfg(test)]
+#[allow(dead_code)]
+const OPTIMIZED_THRESHOLD: u32 = 128 * 128;
 
 fn apply(
     light_source: LightSource,
@@ -246,32 +248,20 @@ fn apply(
         return;
     }
 
-    let total_pixels = src.width.saturating_mul(src.height);
-    if total_pixels < OPTIMIZED_THRESHOLD {
-        apply_naive(
-            light_source,
-            surface_scale,
-            lighting_color,
-            light_factor,
-            calc_alpha,
-            src,
-            dest,
-        );
-    } else {
-        apply_optimized(
-            light_source,
-            surface_scale,
-            lighting_color,
-            light_factor,
-            calc_alpha,
-            src,
-            dest,
-        );
-    }
+    apply_optimized(
+        light_source,
+        surface_scale,
+        lighting_color,
+        light_factor,
+        calc_alpha,
+        src,
+        dest,
+    );
 }
 
-/// Original naive implementation preserved verbatim for correctness reference
-/// and as a fallback for small images.
+/// Original naive implementation preserved verbatim for correctness reference.
+/// Only compiled in test builds for bit-exact verification against the optimized path.
+#[cfg(test)]
 fn apply_naive(
     light_source: LightSource,
     surface_scale: f32,
@@ -356,8 +346,12 @@ fn apply_naive(
 
 /// Optimized implementation using row-based alpha extraction and sliding window.
 ///
+/// The primary gain is improved cache locality, NOT SIMD auto-vectorization
+/// (the `dyn Fn` trait object for `light_factor` prevents inlining and vectorization).
+///
 /// Key optimizations over the naive version:
-/// - Extracts alpha values into contiguous i16 row buffers for cache-friendly access
+/// - Extracts alpha values into contiguous i16 row buffers for cache-friendly access,
+///   avoiding scattered reads from the RGBA pixel array
 /// - Uses a 3-row sliding window, reusing two rows per iteration (only reads one new row)
 /// - Pre-computes spot light direction once instead of per-pixel
 /// - Processes pixels in row-major order with sequential memory access
@@ -803,6 +797,7 @@ fn apply_optimized(
     }
 }
 
+#[cfg(test)]
 fn light_color(light: &LightSource, lighting_color: Color, light_vector: Vector3) -> Color {
     match *light {
         LightSource::DistantLight(_) | LightSource::PointLight(_) => lighting_color,
@@ -834,6 +829,7 @@ fn light_color(light: &LightSource, lighting_color: Color, light_vector: Vector3
     }
 }
 
+#[cfg(test)]
 fn top_left_normal(img: ImageRef) -> Normal {
     let center = img.alpha_at(0, 0);
     let right = img.alpha_at(1, 0);
@@ -848,6 +844,7 @@ fn top_left_normal(img: ImageRef) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn top_right_normal(img: ImageRef) -> Normal {
     let left = img.alpha_at(img.width - 2, 0);
     let center = img.alpha_at(img.width - 1, 0);
@@ -862,6 +859,7 @@ fn top_right_normal(img: ImageRef) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn bottom_left_normal(img: ImageRef) -> Normal {
     let top = img.alpha_at(0, img.height - 2);
     let top_right = img.alpha_at(1, img.height - 2);
@@ -876,6 +874,7 @@ fn bottom_left_normal(img: ImageRef) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn bottom_right_normal(img: ImageRef) -> Normal {
     let top_left = img.alpha_at(img.width - 2, img.height - 2);
     let top = img.alpha_at(img.width - 1, img.height - 2);
@@ -890,6 +889,7 @@ fn bottom_right_normal(img: ImageRef) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn top_row_normal(img: ImageRef, x: u32) -> Normal {
     let left = img.alpha_at(x - 1, 0);
     let center = img.alpha_at(x, 0);
@@ -906,6 +906,7 @@ fn top_row_normal(img: ImageRef, x: u32) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn bottom_row_normal(img: ImageRef, x: u32) -> Normal {
     let top_left = img.alpha_at(x - 1, img.height - 2);
     let top = img.alpha_at(x, img.height - 2);
@@ -922,6 +923,7 @@ fn bottom_row_normal(img: ImageRef, x: u32) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn left_column_normal(img: ImageRef, y: u32) -> Normal {
     let top = img.alpha_at(0, y - 1);
     let top_right = img.alpha_at(1, y - 1);
@@ -938,6 +940,7 @@ fn left_column_normal(img: ImageRef, y: u32) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn right_column_normal(img: ImageRef, y: u32) -> Normal {
     let top_left = img.alpha_at(img.width - 2, y - 1);
     let top = img.alpha_at(img.width - 1, y - 1);
@@ -954,6 +957,7 @@ fn right_column_normal(img: ImageRef, y: u32) -> Normal {
     )
 }
 
+#[cfg(test)]
 fn interior_normal(img: ImageRef, x: u32, y: u32) -> Normal {
     let top_left = img.alpha_at(x - 1, y - 1);
     let top = img.alpha_at(x, y - 1);
