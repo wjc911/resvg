@@ -33,6 +33,21 @@ pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
     }
 }
 
+/// Preserved original entry point (verbatim, no changes).
+#[allow(dead_code)]
+pub fn apply_naive(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
+    let boxes_horz = create_box_gauss(sigma_x as f32);
+    let boxes_vert = create_box_gauss(sigma_y as f32);
+    let mut backbuf = src.data.to_vec();
+    let mut backbuf = ImageRefMut::new(src.width, src.height, &mut backbuf);
+
+    for (box_size_horz, box_size_vert) in boxes_horz.iter().zip(boxes_vert.iter()) {
+        let radius_horz = ((box_size_horz - 1) / 2) as usize;
+        let radius_vert = ((box_size_vert - 1) / 2) as usize;
+        box_blur_impl_naive(radius_horz, radius_vert, &mut backbuf, &mut src);
+    }
+}
+
 #[inline(never)]
 fn create_box_gauss(sigma: f32) -> [i32; STEPS] {
     if sigma > 0.0 {
@@ -70,6 +85,13 @@ fn create_box_gauss(sigma: f32) -> [i32; STEPS] {
     }
 }
 
+// ============================================================
+// Optimized implementation
+// ============================================================
+
+/// Tile width for vertical pass. Chosen to keep working set in L1/L2 cache.
+const VERT_TILE_W: usize = 16;
+
 #[inline]
 fn box_blur_impl(
     blur_radius_horz: usize,
@@ -77,12 +99,295 @@ fn box_blur_impl(
     backbuf: &mut ImageRefMut,
     frontbuf: &mut ImageRefMut,
 ) {
-    box_blur_vert(blur_radius_vert, frontbuf, backbuf);
-    box_blur_horz(blur_radius_horz, backbuf, frontbuf);
+    box_blur_vert_tiled(blur_radius_vert, frontbuf, backbuf);
+    box_blur_horz_opt(blur_radius_horz, backbuf, frontbuf);
+}
+
+/// Optimized vertical box blur: processes columns in tiles for cache locality,
+/// uses `[i32; 4]` accumulators for SIMD auto-vectorization.
+fn box_blur_vert_tiled(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
+    if blur_radius == 0 {
+        frontbuf.data.copy_from_slice(backbuf.data);
+        return;
+    }
+
+    let width = backbuf.width as usize;
+    let height = backbuf.height as usize;
+    let iarr = 1.0 / (blur_radius + blur_radius + 1) as f32;
+
+    // Process columns in tiles for better cache locality.
+    let mut col = 0;
+    while col < width {
+        let tile_end = cmp::min(col + VERT_TILE_W, width);
+        for i in col..tile_end {
+            box_blur_vert_single_col(
+                blur_radius,
+                width,
+                height,
+                iarr,
+                i,
+                backbuf.data,
+                frontbuf.data,
+            );
+        }
+        col = tile_end;
+    }
+}
+
+/// Process a single column with [i32; 4] accumulators for auto-vectorization.
+#[inline]
+fn box_blur_vert_single_col(
+    blur_radius: usize,
+    width: usize,
+    height: usize,
+    iarr: f32,
+    col: usize,
+    backbuf: &[RGBA8],
+    frontbuf: &mut [RGBA8],
+) {
+    let col_end = col + width * (height - 1);
+    let mut ti = col;
+    let mut li = col;
+    let mut ri = col + blur_radius * width;
+
+    let fv: [i32; 4] = [0; 4]; // default RGBA8 is all zeros
+    let lv: [i32; 4] = [0; 4];
+
+    let blur_radius_next = blur_radius as i32 + 1;
+    let mut val: [i32; 4] = [
+        blur_radius_next * fv[0],
+        blur_radius_next * fv[1],
+        blur_radius_next * fv[2],
+        blur_radius_next * fv[3],
+    ];
+
+    #[inline(always)]
+    fn px_to_arr(p: RGBA8) -> [i32; 4] {
+        [p.r as i32, p.g as i32, p.b as i32, p.a as i32]
+    }
+
+    for j in 0..cmp::min(blur_radius, height) {
+        let bb = px_to_arr(backbuf[ti + j * width]);
+        val[0] += bb[0];
+        val[1] += bb[1];
+        val[2] += bb[2];
+        val[3] += bb[3];
+    }
+
+    if blur_radius > height {
+        let blur_radius_prev = blur_radius as i32 - height as i32;
+        val[0] += blur_radius_prev * lv[0];
+        val[1] += blur_radius_prev * lv[1];
+        val[2] += blur_radius_prev * lv[2];
+        val[3] += blur_radius_prev * lv[3];
+    }
+
+    // Top border region
+    for _ in 0..cmp::min(height, blur_radius + 1) {
+        let bb = if ri > col_end {
+            lv
+        } else {
+            px_to_arr(backbuf[ri])
+        };
+        ri += width;
+        val[0] += bb[0] - fv[0];
+        val[1] += bb[1] - fv[1];
+        val[2] += bb[2] - fv[2];
+        val[3] += bb[3] - fv[3];
+
+        frontbuf[ti] = RGBA8 {
+            r: round(val[0] as f32 * iarr) as u8,
+            g: round(val[1] as f32 * iarr) as u8,
+            b: round(val[2] as f32 * iarr) as u8,
+            a: round(val[3] as f32 * iarr) as u8,
+        };
+        ti += width;
+    }
+
+    if height <= blur_radius {
+        return;
+    }
+
+    // Middle region (no border checks needed)
+    for _ in (blur_radius + 1)..(height - blur_radius) {
+        let bb1 = px_to_arr(backbuf[ri]);
+        ri += width;
+        let bb2 = px_to_arr(backbuf[li]);
+        li += width;
+
+        val[0] += bb1[0] - bb2[0];
+        val[1] += bb1[1] - bb2[1];
+        val[2] += bb1[2] - bb2[2];
+        val[3] += bb1[3] - bb2[3];
+
+        frontbuf[ti] = RGBA8 {
+            r: round(val[0] as f32 * iarr) as u8,
+            g: round(val[1] as f32 * iarr) as u8,
+            b: round(val[2] as f32 * iarr) as u8,
+            a: round(val[3] as f32 * iarr) as u8,
+        };
+        ti += width;
+    }
+
+    // Bottom border region
+    for _ in 0..cmp::min(height - blur_radius - 1, blur_radius) {
+        let bb = if li < col { fv } else { px_to_arr(backbuf[li]) };
+        li += width;
+
+        val[0] += lv[0] - bb[0];
+        val[1] += lv[1] - bb[1];
+        val[2] += lv[2] - bb[2];
+        val[3] += lv[3] - bb[3];
+
+        frontbuf[ti] = RGBA8 {
+            r: round(val[0] as f32 * iarr) as u8,
+            g: round(val[1] as f32 * iarr) as u8,
+            b: round(val[2] as f32 * iarr) as u8,
+            a: round(val[3] as f32 * iarr) as u8,
+        };
+        ti += width;
+    }
+}
+
+/// Optimized horizontal box blur with [i32; 4] accumulators.
+fn box_blur_horz_opt(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
+    if blur_radius == 0 {
+        frontbuf.data.copy_from_slice(backbuf.data);
+        return;
+    }
+
+    let width = backbuf.width as usize;
+    let height = backbuf.height as usize;
+    let iarr = 1.0 / (blur_radius + blur_radius + 1) as f32;
+
+    #[inline(always)]
+    fn px_to_arr(p: RGBA8) -> [i32; 4] {
+        [p.r as i32, p.g as i32, p.b as i32, p.a as i32]
+    }
+
+    for i in 0..height {
+        let row_start = i * width;
+        let row_end = (i + 1) * width - 1;
+        let mut ti = row_start;
+        let mut li = ti;
+        let mut ri = ti + blur_radius;
+
+        let fv: [i32; 4] = [0; 4];
+        let lv: [i32; 4] = [0; 4];
+
+        let blur_radius_next = blur_radius as i32 + 1;
+        let mut val: [i32; 4] = [
+            blur_radius_next * fv[0],
+            blur_radius_next * fv[1],
+            blur_radius_next * fv[2],
+            blur_radius_next * fv[3],
+        ];
+
+        for j in 0..cmp::min(blur_radius, width) {
+            let bb = px_to_arr(backbuf.data[ti + j]);
+            val[0] += bb[0];
+            val[1] += bb[1];
+            val[2] += bb[2];
+            val[3] += bb[3];
+        }
+
+        if blur_radius > width {
+            let blur_radius_prev = blur_radius as i32 - width as i32;
+            val[0] += blur_radius_prev * lv[0];
+            val[1] += blur_radius_prev * lv[1];
+            val[2] += blur_radius_prev * lv[2];
+            val[3] += blur_radius_prev * lv[3];
+        }
+
+        // Left border region
+        for _ in 0..cmp::min(width, blur_radius + 1) {
+            let bb = if ri > row_end {
+                lv
+            } else {
+                px_to_arr(backbuf.data[ri])
+            };
+            ri += 1;
+            val[0] += bb[0] - fv[0];
+            val[1] += bb[1] - fv[1];
+            val[2] += bb[2] - fv[2];
+            val[3] += bb[3] - fv[3];
+
+            frontbuf.data[ti] = RGBA8 {
+                r: round(val[0] as f32 * iarr) as u8,
+                g: round(val[1] as f32 * iarr) as u8,
+                b: round(val[2] as f32 * iarr) as u8,
+                a: round(val[3] as f32 * iarr) as u8,
+            };
+            ti += 1;
+        }
+
+        if width <= blur_radius {
+            continue;
+        }
+
+        // Middle region (no border checks)
+        for _ in (blur_radius + 1)..(width - blur_radius) {
+            let bb1 = px_to_arr(backbuf.data[ri]);
+            ri += 1;
+            let bb2 = px_to_arr(backbuf.data[li]);
+            li += 1;
+
+            val[0] += bb1[0] - bb2[0];
+            val[1] += bb1[1] - bb2[1];
+            val[2] += bb1[2] - bb2[2];
+            val[3] += bb1[3] - bb2[3];
+
+            frontbuf.data[ti] = RGBA8 {
+                r: round(val[0] as f32 * iarr) as u8,
+                g: round(val[1] as f32 * iarr) as u8,
+                b: round(val[2] as f32 * iarr) as u8,
+                a: round(val[3] as f32 * iarr) as u8,
+            };
+            ti += 1;
+        }
+
+        // Right border region
+        for _ in 0..cmp::min(width - blur_radius - 1, blur_radius) {
+            let bb = if li < row_start {
+                fv
+            } else {
+                px_to_arr(backbuf.data[li])
+            };
+            li += 1;
+
+            val[0] += lv[0] - bb[0];
+            val[1] += lv[1] - bb[1];
+            val[2] += lv[2] - bb[2];
+            val[3] += lv[3] - bb[3];
+
+            frontbuf.data[ti] = RGBA8 {
+                r: round(val[0] as f32 * iarr) as u8,
+                g: round(val[1] as f32 * iarr) as u8,
+                b: round(val[2] as f32 * iarr) as u8,
+                a: round(val[3] as f32 * iarr) as u8,
+            };
+            ti += 1;
+        }
+    }
+}
+
+// ============================================================
+// Naive implementation (verbatim original, preserved for testing)
+// ============================================================
+
+#[inline]
+fn box_blur_impl_naive(
+    blur_radius_horz: usize,
+    blur_radius_vert: usize,
+    backbuf: &mut ImageRefMut,
+    frontbuf: &mut ImageRefMut,
+) {
+    box_blur_vert_naive(blur_radius_vert, frontbuf, backbuf);
+    box_blur_horz_naive(blur_radius_horz, backbuf, frontbuf);
 }
 
 #[inline]
-fn box_blur_vert(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
+fn box_blur_vert_naive(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
     if blur_radius == 0 {
         frontbuf.data.copy_from_slice(backbuf.data);
         return;
@@ -199,7 +504,7 @@ fn box_blur_vert(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut Image
 }
 
 #[inline]
-fn box_blur_horz(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
+fn box_blur_horz_naive(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
     if blur_radius == 0 {
         frontbuf.data.copy_from_slice(backbuf.data);
         return;

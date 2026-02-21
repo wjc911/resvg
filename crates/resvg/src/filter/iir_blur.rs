@@ -44,8 +44,14 @@ struct BlurData {
 ///
 /// # Allocations
 ///
-/// This method will allocate a 2x `src` buffer.
+/// This method will allocate a buffer for intermediate computation.
 pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
+    apply_optimized(sigma_x, sigma_y, src);
+}
+
+/// Preserved original entry point (verbatim, no changes).
+#[allow(dead_code)]
+pub fn apply_naive(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let buf_size = (src.width * src.height) as usize;
     let mut buf = vec![0.0; buf_size];
     let buf = &mut buf;
@@ -144,4 +150,133 @@ fn gen_coefficients(sigma: f64, steps: usize) -> (f64, f64) {
     let lambda = (sigma * sigma) / (2.0 * steps as f64);
     let dnu = (1.0 + 2.0 * lambda - (1.0 + 4.0 * lambda).sqrt()) / (2.0 * lambda);
     (lambda, dnu)
+}
+
+// ============================================================
+// Optimized implementation: all 4 channels interleaved, f64, tiled vertical
+// ============================================================
+
+/// Tile width for the vertical pass of the IIR filter.
+const IIR_VERT_TILE_W: usize = 32;
+
+/// Optimized IIR blur that processes all 4 RGBA channels simultaneously
+/// using `[f64; 4]` arrays for SIMD auto-vectorization, and tiles the
+/// vertical pass for better cache locality. Uses f64 to stay bit-exact
+/// with the original implementation.
+fn apply_optimized(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
+    let width = src.width as usize;
+    let height = src.height as usize;
+    let pixel_count = width * height;
+    let steps = 4usize;
+
+    // Allocate interleaved f64 buffer: 4 channels per pixel.
+    // This processes all channels in a single pass instead of 4 separate passes,
+    // improving cache utilization by 4x.
+    let mut buf = vec![[0.0f64; 4]; pixel_count];
+
+    let data = src.data.as_mut_slice();
+
+    // Convert u8 RGBA to f64 [0..1] interleaved.
+    for i in 0..pixel_count {
+        let base = i * 4;
+        buf[i] = [
+            data[base] as f64 / 255.0,
+            data[base + 1] as f64 / 255.0,
+            data[base + 2] as f64 / 255.0,
+            data[base + 3] as f64 / 255.0,
+        ];
+    }
+
+    // Filter horizontally along each row.
+    let (lambda_x, dnu_x) = if sigma_x > 0.0 {
+        let (lambda, dnu) = gen_coefficients(sigma_x, steps);
+
+        for y in 0..height {
+            let idx = width * y;
+
+            for _ in 0..steps {
+                // Filter rightwards.
+                for x in 1..width {
+                    let prev = buf[idx + x - 1];
+                    let cur = &mut buf[idx + x];
+                    cur[0] += dnu * prev[0];
+                    cur[1] += dnu * prev[1];
+                    cur[2] += dnu * prev[2];
+                    cur[3] += dnu * prev[3];
+                }
+
+                // Filter leftwards.
+                let mut x = width - 1;
+                while x > 0 {
+                    let next = buf[idx + x];
+                    let cur = &mut buf[idx + x - 1];
+                    cur[0] += dnu * next[0];
+                    cur[1] += dnu * next[1];
+                    cur[2] += dnu * next[2];
+                    cur[3] += dnu * next[3];
+                    x -= 1;
+                }
+            }
+        }
+
+        (lambda, dnu)
+    } else {
+        (1.0, 1.0)
+    };
+
+    // Filter vertically along each column, processing in tiles for cache locality.
+    let (lambda_y, dnu_y) = if sigma_y > 0.0 {
+        let (lambda, dnu) = gen_coefficients(sigma_y, steps);
+
+        let mut col = 0;
+        while col < width {
+            let tile_end = std::cmp::min(col + IIR_VERT_TILE_W, width);
+
+            for x in col..tile_end {
+                for _ in 0..steps {
+                    // Filter downwards.
+                    let mut y_off = width;
+                    while y_off < buf.len() {
+                        let prev = buf[x + y_off - width];
+                        let cur = &mut buf[x + y_off];
+                        cur[0] += dnu * prev[0];
+                        cur[1] += dnu * prev[1];
+                        cur[2] += dnu * prev[2];
+                        cur[3] += dnu * prev[3];
+                        y_off += width;
+                    }
+
+                    // Filter upwards.
+                    y_off = buf.len() - width;
+                    while y_off > 0 {
+                        let next = buf[x + y_off];
+                        let cur = &mut buf[x + y_off - width];
+                        cur[0] += dnu * next[0];
+                        cur[1] += dnu * next[1];
+                        cur[2] += dnu * next[2];
+                        cur[3] += dnu * next[3];
+                        y_off -= width;
+                    }
+                }
+            }
+
+            col = tile_end;
+        }
+
+        (lambda, dnu)
+    } else {
+        (1.0, 1.0)
+    };
+
+    // Apply post-scale and convert back to u8.
+    let post_scale = ((dnu_x * dnu_y).sqrt() / (lambda_x * lambda_y).sqrt()).powi(2 * steps as i32);
+
+    for i in 0..pixel_count {
+        let base = i * 4;
+        let px = buf[i];
+        data[base] = (px[0] * post_scale * 255.0) as u8;
+        data[base + 1] = (px[1] * post_scale * 255.0) as u8;
+        data[base + 2] = (px[2] * post_scale * 255.0) as u8;
+        data[base + 3] = (px[3] * post_scale * 255.0) as u8;
+    }
 }

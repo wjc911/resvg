@@ -14,6 +14,10 @@ workspace = "../.."
 name = "resvg"
 required-features = ["text", "system-fonts", "memmap-fonts"]
 
+[[bench]]
+name = "blur_bench"
+harness = false
+
 [dependencies]
 gif = { version = "0.14.1", optional = true }
 image-webp = { version = "0.2.4", optional = true }
