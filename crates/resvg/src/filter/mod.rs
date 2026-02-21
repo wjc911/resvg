@@ -46,7 +46,6 @@ impl<'a> ImageRef<'a> {
         }
     }
 
-    #[cfg(test)]
     #[inline]
     fn alpha_at(&self, x: u32, y: u32) -> i16 {
         self.data[(self.width * y + x) as usize].a as i16

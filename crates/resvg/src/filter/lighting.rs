@@ -231,8 +231,6 @@ pub fn specular_lighting(
 /// Threshold (in total pixel count) at which the optimized path breaks even with naive.
 /// Benchmark shows 64x64 distant light is 0.93x (slower on the optimized path),
 /// while 256x256 is clearly faster. 128x128 is a conservative crossover point.
-#[cfg(test)]
-#[allow(dead_code)]
 const OPTIMIZED_THRESHOLD: u32 = 128 * 128;
 
 fn apply(
@@ -248,20 +246,32 @@ fn apply(
         return;
     }
 
-    apply_optimized(
-        light_source,
-        surface_scale,
-        lighting_color,
-        light_factor,
-        calc_alpha,
-        src,
-        dest,
-    );
+    let pixel_count = src.width * src.height;
+    if pixel_count < OPTIMIZED_THRESHOLD {
+        apply_naive(
+            light_source,
+            surface_scale,
+            lighting_color,
+            light_factor,
+            calc_alpha,
+            src,
+            dest,
+        );
+    } else {
+        apply_optimized(
+            light_source,
+            surface_scale,
+            lighting_color,
+            light_factor,
+            calc_alpha,
+            src,
+            dest,
+        );
+    }
 }
 
-/// Original naive implementation preserved verbatim for correctness reference.
-/// Only compiled in test builds for bit-exact verification against the optimized path.
-#[cfg(test)]
+/// Original naive implementation used for small images (below `OPTIMIZED_THRESHOLD` pixels).
+/// Also used in test builds for bit-exact verification against the optimized path.
 fn apply_naive(
     light_source: LightSource,
     surface_scale: f32,
@@ -797,7 +807,6 @@ fn apply_optimized(
     }
 }
 
-#[cfg(test)]
 fn light_color(light: &LightSource, lighting_color: Color, light_vector: Vector3) -> Color {
     match *light {
         LightSource::DistantLight(_) | LightSource::PointLight(_) => lighting_color,
@@ -829,7 +838,6 @@ fn light_color(light: &LightSource, lighting_color: Color, light_vector: Vector3
     }
 }
 
-#[cfg(test)]
 fn top_left_normal(img: ImageRef) -> Normal {
     let center = img.alpha_at(0, 0);
     let right = img.alpha_at(1, 0);
@@ -844,7 +852,6 @@ fn top_left_normal(img: ImageRef) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn top_right_normal(img: ImageRef) -> Normal {
     let left = img.alpha_at(img.width - 2, 0);
     let center = img.alpha_at(img.width - 1, 0);
@@ -859,7 +866,6 @@ fn top_right_normal(img: ImageRef) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn bottom_left_normal(img: ImageRef) -> Normal {
     let top = img.alpha_at(0, img.height - 2);
     let top_right = img.alpha_at(1, img.height - 2);
@@ -874,7 +880,6 @@ fn bottom_left_normal(img: ImageRef) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn bottom_right_normal(img: ImageRef) -> Normal {
     let top_left = img.alpha_at(img.width - 2, img.height - 2);
     let top = img.alpha_at(img.width - 1, img.height - 2);
@@ -889,7 +894,6 @@ fn bottom_right_normal(img: ImageRef) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn top_row_normal(img: ImageRef, x: u32) -> Normal {
     let left = img.alpha_at(x - 1, 0);
     let center = img.alpha_at(x, 0);
@@ -906,7 +910,6 @@ fn top_row_normal(img: ImageRef, x: u32) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn bottom_row_normal(img: ImageRef, x: u32) -> Normal {
     let top_left = img.alpha_at(x - 1, img.height - 2);
     let top = img.alpha_at(x, img.height - 2);
@@ -923,7 +926,6 @@ fn bottom_row_normal(img: ImageRef, x: u32) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn left_column_normal(img: ImageRef, y: u32) -> Normal {
     let top = img.alpha_at(0, y - 1);
     let top_right = img.alpha_at(1, y - 1);
@@ -940,7 +942,6 @@ fn left_column_normal(img: ImageRef, y: u32) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn right_column_normal(img: ImageRef, y: u32) -> Normal {
     let top_left = img.alpha_at(img.width - 2, y - 1);
     let top = img.alpha_at(img.width - 1, y - 1);
@@ -957,7 +958,6 @@ fn right_column_normal(img: ImageRef, y: u32) -> Normal {
     )
 }
 
-#[cfg(test)]
 fn interior_normal(img: ImageRef, x: u32, y: u32) -> Normal {
     let top_left = img.alpha_at(x - 1, y - 1);
     let top = img.alpha_at(x, y - 1);
