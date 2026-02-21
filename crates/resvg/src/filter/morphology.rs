@@ -32,7 +32,8 @@ pub fn apply(operator: MorphologyOperator, rx: f32, ry: f32, src: ImageRefMut) {
 }
 
 /// Original naive O(n × r²) morphology — used as fallback for small kernels.
-fn apply_naive(operator: MorphologyOperator, columns: u32, rows: u32, src: ImageRefMut) {
+#[doc(hidden)]
+pub fn apply_naive(operator: MorphologyOperator, columns: u32, rows: u32, src: ImageRefMut) {
     let target_x = (columns as f32 / 2.0).floor() as u32;
     let target_y = (rows as f32 / 2.0).floor() as u32;
 
@@ -290,6 +291,15 @@ fn apply_vhgw<Op: MorphOp>(columns: u32, rows: u32, src: ImageRefMut) {
             }
             x = tile_end;
         }
+    }
+}
+
+/// Public wrapper around the vHGW algorithm for benchmarking.
+#[doc(hidden)]
+pub fn apply_vhgw_pub(operator: MorphologyOperator, columns: u32, rows: u32, src: ImageRefMut) {
+    match operator {
+        MorphologyOperator::Erode => apply_vhgw::<ErodeOp>(columns, rows, src),
+        MorphologyOperator::Dilate => apply_vhgw::<DilateOp>(columns, rows, src),
     }
 }
 
