@@ -13,6 +13,7 @@ type Lut = [u8; 256];
 /// arithmetic that `transfer_scalar` would compute, then store the u8 result.
 /// This is bit-exact with the per-pixel path because the inputs are always u8
 /// values (0..=255) and the computation is deterministic.
+#[inline(never)]
 fn build_lut(func: &TransferFunction) -> Lut {
     let mut lut: Lut = [0u8; 256];
     for i in 0u16..=255 {
@@ -54,6 +55,7 @@ fn lut_threshold(func: &TransferFunction) -> usize {
 ///
 /// For images below the threshold, direct per-pixel `transfer_scalar()` calls
 /// are used, avoiding the fixed LUT construction overhead.
+#[inline(never)]
 pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
     let func_r = fe.func_r();
     let func_g = fe.func_g();
