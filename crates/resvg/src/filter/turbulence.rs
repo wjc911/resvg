@@ -323,7 +323,7 @@ fn noise2_naive(
 // ---------------------------------------------------------------------------
 
 /// Flat gradient table: gradient_flat[channel][index] = [gx, gy]
-/// Stored as fixed-size arrays for cache-friendly access and auto-vectorization.
+/// Stored as fixed-size arrays for cache-friendly access (no heap indirection).
 struct GradientTable {
     /// gradient[channel][lattice_index] = (gx, gy)
     data: [[[f64; 2]; B_LEN]; 4],
@@ -469,21 +469,21 @@ fn turbulence_4ch(
     let mut sums = [0.0f64; 4];
     x *= base_freq_x;
     y *= base_freq_y;
-    let mut ratio = 1.0;
+    let mut inv_ratio = 1.0_f64;
     for _ in 0..num_octaves {
         let n = noise2_4ch(x, y, lattice_selector, gradient, stitch);
         if fractal_sum {
             for ch in 0..4 {
-                sums[ch] += n[ch] / ratio;
+                sums[ch] += n[ch] * inv_ratio;
             }
         } else {
             for ch in 0..4 {
-                sums[ch] += n[ch].abs() / ratio;
+                sums[ch] += n[ch].abs() * inv_ratio;
             }
         }
         x *= 2.0;
         y *= 2.0;
-        ratio *= 2.0;
+        inv_ratio *= 0.5;
 
         if let Some(ref mut s) = stitch {
             s.width *= 2;
@@ -539,7 +539,10 @@ fn apply_optimized(
             }
         }
 
-        Some((base_freq_x, base_freq_y))
+        // sw and sh depend only on tile dimensions and base frequencies — constant per frame.
+        let sw = (tile_width * base_freq_x + 0.5) as i32;
+        let sh = (tile_height * base_freq_y + 0.5) as i32;
+        Some((base_freq_x, base_freq_y, sw, sh))
     } else {
         None
     };
@@ -550,10 +553,8 @@ fn apply_optimized(
         let tx = (px as f64 + offset_x) / sx;
         let ty = (py as f64 + offset_y) / sy;
 
-        // Build per-pixel stitch info using pre-computed frequencies
-        let stitch = initial_stitch.map(|(bfx, bfy)| {
-            let sw = (tile_width * bfx + 0.5) as i32;
-            let sh = (tile_height * bfy + 0.5) as i32;
+        // Build per-pixel stitch info; only wrap_x/wrap_y vary per pixel.
+        let stitch = initial_stitch.map(|(bfx, bfy, sw, sh)| {
             let wx = (px as f64 * bfx + PERLIN_N as f64 + sw as f64) as i32;
             let wy = (py as f64 * bfy + PERLIN_N as f64 + sh as f64) as i32;
             StitchInfo {
@@ -576,7 +577,6 @@ fn apply_optimized(
             &gradient,
         );
 
-        #[inline(always)]
         fn to_u8(val: f64, fractal_noise: bool) -> u8 {
             let v = if fractal_noise {
                 (val * 255.0 + 255.0) / 2.0
