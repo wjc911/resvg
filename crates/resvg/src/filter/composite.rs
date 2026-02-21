@@ -17,6 +17,8 @@ const BATCH: usize = 64;
 
 /// Original (naive) arithmetic implementation — preserved verbatim for correctness
 /// reference and for small images where setup overhead dominates.
+#[cold]
+#[inline(never)]
 fn arithmetic_naive(
     k1: f32,
     k2: f32,
@@ -61,6 +63,7 @@ fn arithmetic_naive(
 /// per-pixel alpha-zero branch are inherently scalar. The main benefit is
 /// better instruction-level parallelism and cache locality for the arithmetic
 /// computation.
+#[inline(never)]
 fn arithmetic_optimized(
     k1: f32,
     k2: f32,
