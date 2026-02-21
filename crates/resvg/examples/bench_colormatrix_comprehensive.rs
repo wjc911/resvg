@@ -9,11 +9,13 @@
 //! loop that LLVM auto-vectorizes across multiple pixels.
 //!
 //! Uses median-of-N-runs methodology with interleaved execution.
+//! Benchmark configurations are executed in parallel across CPU cores.
 //!
 //! Run with:
 //!   cargo run --release -p resvg --example bench_colormatrix_comprehensive
 
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rgb::RGBA8;
@@ -360,6 +362,7 @@ fn bench_pair<FN: FnMut(), FO: FnMut()>(
 // ---------------------------------------------------------------------------
 
 struct BenchResult {
+    order: usize,
     image_size: String,
     matrix_type: String,
     input_pattern: String,
@@ -367,6 +370,130 @@ struct BenchResult {
     new_us: f64,
     speedup: f64,
     pixel_count: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Configuration for one benchmark run
+// ---------------------------------------------------------------------------
+
+/// The kind of color-matrix operation to benchmark.
+#[derive(Clone)]
+enum OpKind {
+    Matrix(Vec<f32>),
+    Saturate(f32),
+    HueRotate(f32),
+    LuminanceToAlpha,
+}
+
+/// Which input-pattern generator to use (must be representable as an enum
+/// because function pointers are not `Send` through all code paths and an
+/// enum is cleaner).
+#[derive(Clone, Copy)]
+enum PatternKind {
+    SolidOpaque,
+    Gradient,
+    RandomRgba,
+}
+
+impl PatternKind {
+    fn label(self) -> &'static str {
+        match self {
+            PatternKind::SolidOpaque => "solid_opaque",
+            PatternKind::Gradient => "gradient",
+            PatternKind::RandomRgba => "random_rgba",
+        }
+    }
+
+    fn generate(self, n: usize) -> Vec<RGBA8> {
+        match self {
+            PatternKind::SolidOpaque => make_solid_opaque(n),
+            PatternKind::Gradient => make_gradient(n),
+            PatternKind::RandomRgba => make_random_rgba(n),
+        }
+    }
+}
+
+/// All parameters needed for a single benchmark measurement.
+#[derive(Clone)]
+struct Config {
+    order: usize,
+    width: u32,
+    height: u32,
+    matrix_label: String,
+    pattern: PatternKind,
+    op: OpKind,
+}
+
+/// Execute a single benchmark configuration and return the result.
+fn run_config(cfg: &Config) -> BenchResult {
+    let n = (cfg.width * cfg.height) as usize;
+    let base = cfg.pattern.generate(n);
+    let mut d1 = base.clone();
+    let mut d2 = base.clone();
+
+    let (old_ns, new_ns) = match &cfg.op {
+        OpKind::Matrix(m) => bench_pair(
+            &mut || {
+                d1.copy_from_slice(&base);
+                old_matrix(black_box(m), black_box(&mut d1));
+            },
+            &mut || {
+                d2.copy_from_slice(&base);
+                new_matrix(black_box(m), black_box(&mut d2));
+            },
+            n,
+        ),
+        OpKind::Saturate(v) => {
+            let v = *v;
+            bench_pair(
+                &mut || {
+                    d1.copy_from_slice(&base);
+                    old_saturate(black_box(v), black_box(&mut d1));
+                },
+                &mut || {
+                    d2.copy_from_slice(&base);
+                    new_saturate(black_box(v), black_box(&mut d2));
+                },
+                n,
+            )
+        }
+        OpKind::HueRotate(angle) => {
+            let angle = *angle;
+            bench_pair(
+                &mut || {
+                    d1.copy_from_slice(&base);
+                    old_hue_rotate(black_box(angle), black_box(&mut d1));
+                },
+                &mut || {
+                    d2.copy_from_slice(&base);
+                    new_hue_rotate(black_box(angle), black_box(&mut d2));
+                },
+                n,
+            )
+        }
+        OpKind::LuminanceToAlpha => bench_pair(
+            &mut || {
+                d1.copy_from_slice(&base);
+                old_luminance_to_alpha(black_box(&mut d1));
+            },
+            &mut || {
+                d2.copy_from_slice(&base);
+                new_luminance_to_alpha(black_box(&mut d2));
+            },
+            n,
+        ),
+    };
+
+    BenchResult {
+        order: cfg.order,
+        image_size: format!("{}x{}", cfg.width, cfg.height),
+        matrix_type: cfg.matrix_label.clone(),
+        input_pattern: cfg.pattern.label().to_string(),
+        old_us: old_ns / 1000.0,
+        new_us: new_ns / 1000.0,
+        speedup: old_ns / new_ns,
+        pixel_count: n,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,20 +511,21 @@ fn main() {
         (2048, 2048),
     ];
 
-    let input_patterns: &[(&str, fn(usize) -> Vec<RGBA8>)] = &[
-        ("solid_opaque", make_solid_opaque),
-        ("gradient", make_gradient),
-        ("random_rgba", make_random_rgba),
+    let patterns = [
+        PatternKind::SolidOpaque,
+        PatternKind::Gradient,
+        PatternKind::RandomRgba,
     ];
-
-    let mut results: Vec<BenchResult> = Vec::new();
 
     println!("feColorMatrix Comprehensive Benchmark (old f32_bound vs new f32::clamp)");
     println!("========================================================================");
     println!("Methodology: median of {} interleaved runs", NUM_ROUNDS);
     println!();
 
-    // --- Matrix configs ---
+    // --- Build all benchmark configurations upfront ---
+    let mut configs: Vec<Config> = Vec::new();
+
+    // Matrix configs
     let matrix_configs: Vec<(&str, Vec<f32>)> = vec![
         ("Matrix/identity", identity_4x5()),
         ("Matrix/sepia", sepia_4x5()),
@@ -408,139 +536,113 @@ fn main() {
     ];
 
     for (name, m) in &matrix_configs {
-        eprint!("  {}...", name);
-        for &(pat, pat_fn) in input_patterns {
+        for &pat in &patterns {
             for &(w, h) in sizes {
-                let n = (w * h) as usize;
-                let base = pat_fn(n);
-                let mut d1 = base.clone();
-                let mut d2 = base.clone();
-                let (old_ns, new_ns) = bench_pair(
-                    &mut || {
-                        d1.copy_from_slice(&base);
-                        old_matrix(black_box(m), black_box(&mut d1));
-                    },
-                    &mut || {
-                        d2.copy_from_slice(&base);
-                        new_matrix(black_box(m), black_box(&mut d2));
-                    },
-                    n,
-                );
-                results.push(BenchResult {
-                    image_size: format!("{}x{}", w, h),
-                    matrix_type: name.to_string(),
-                    input_pattern: pat.to_string(),
-                    old_us: old_ns / 1000.0,
-                    new_us: new_ns / 1000.0,
-                    speedup: old_ns / new_ns,
-                    pixel_count: n,
+                configs.push(Config {
+                    order: configs.len(),
+                    width: w,
+                    height: h,
+                    matrix_label: name.to_string(),
+                    pattern: pat,
+                    op: OpKind::Matrix(m.clone()),
                 });
             }
         }
-        eprintln!(" done");
     }
 
-    // --- Saturate ---
+    // Saturate configs
     for &sat_val in &[0.0001f32, 0.5, 1.0, 2.0] {
         let label = format!("Saturate/{:.1}", sat_val);
-        eprint!("  {}...", label);
-        for &(pat, pat_fn) in input_patterns {
+        for &pat in &patterns {
             for &(w, h) in sizes {
-                let n = (w * h) as usize;
-                let base = pat_fn(n);
-                let mut d1 = base.clone();
-                let mut d2 = base.clone();
-                let (old_ns, new_ns) = bench_pair(
-                    &mut || {
-                        d1.copy_from_slice(&base);
-                        old_saturate(black_box(sat_val), black_box(&mut d1));
-                    },
-                    &mut || {
-                        d2.copy_from_slice(&base);
-                        new_saturate(black_box(sat_val), black_box(&mut d2));
-                    },
-                    n,
-                );
-                results.push(BenchResult {
-                    image_size: format!("{}x{}", w, h),
-                    matrix_type: label.clone(),
-                    input_pattern: pat.to_string(),
-                    old_us: old_ns / 1000.0,
-                    new_us: new_ns / 1000.0,
-                    speedup: old_ns / new_ns,
-                    pixel_count: n,
+                configs.push(Config {
+                    order: configs.len(),
+                    width: w,
+                    height: h,
+                    matrix_label: label.clone(),
+                    pattern: pat,
+                    op: OpKind::Saturate(sat_val),
                 });
             }
         }
-        eprintln!(" done");
     }
 
-    // --- HueRotate ---
+    // HueRotate configs
     for &angle in &[0.0f32, 45.0, 90.0, 180.0, 270.0] {
         let label = format!("HueRotate/{}deg", angle as i32);
-        eprint!("  {}...", label);
-        for &(pat, pat_fn) in input_patterns {
+        for &pat in &patterns {
             for &(w, h) in sizes {
-                let n = (w * h) as usize;
-                let base = pat_fn(n);
-                let mut d1 = base.clone();
-                let mut d2 = base.clone();
-                let (old_ns, new_ns) = bench_pair(
-                    &mut || {
-                        d1.copy_from_slice(&base);
-                        old_hue_rotate(black_box(angle), black_box(&mut d1));
-                    },
-                    &mut || {
-                        d2.copy_from_slice(&base);
-                        new_hue_rotate(black_box(angle), black_box(&mut d2));
-                    },
-                    n,
-                );
-                results.push(BenchResult {
-                    image_size: format!("{}x{}", w, h),
-                    matrix_type: label.clone(),
-                    input_pattern: pat.to_string(),
-                    old_us: old_ns / 1000.0,
-                    new_us: new_ns / 1000.0,
-                    speedup: old_ns / new_ns,
-                    pixel_count: n,
+                configs.push(Config {
+                    order: configs.len(),
+                    width: w,
+                    height: h,
+                    matrix_label: label.clone(),
+                    pattern: pat,
+                    op: OpKind::HueRotate(angle),
                 });
             }
         }
-        eprintln!(" done");
     }
 
-    // --- LuminanceToAlpha ---
-    eprint!("  LuminanceToAlpha...");
-    for &(pat, pat_fn) in input_patterns {
+    // LuminanceToAlpha configs
+    for &pat in &patterns {
         for &(w, h) in sizes {
-            let n = (w * h) as usize;
-            let base = pat_fn(n);
-            let mut d1 = base.clone();
-            let mut d2 = base.clone();
-            let (old_ns, new_ns) = bench_pair(
-                &mut || {
-                    d1.copy_from_slice(&base);
-                    old_luminance_to_alpha(black_box(&mut d1));
-                },
-                &mut || {
-                    d2.copy_from_slice(&base);
-                    new_luminance_to_alpha(black_box(&mut d2));
-                },
-                n,
-            );
-            results.push(BenchResult {
-                image_size: format!("{}x{}", w, h),
-                matrix_type: "LuminanceToAlpha".to_string(),
-                input_pattern: pat.to_string(),
-                old_us: old_ns / 1000.0,
-                new_us: new_ns / 1000.0,
-                speedup: old_ns / new_ns,
-                pixel_count: n,
+            configs.push(Config {
+                order: configs.len(),
+                width: w,
+                height: h,
+                matrix_label: "LuminanceToAlpha".to_string(),
+                pattern: pat,
+                op: OpKind::LuminanceToAlpha,
             });
         }
     }
-    eprintln!(" done");
+
+    let total = configs.len();
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    eprintln!(
+        "Running {} benchmark configurations across {} threads...",
+        total, num_threads
+    );
+
+    // --- Parallel execution ---
+    let progress = AtomicUsize::new(0);
+
+    let mut results: Vec<BenchResult> = std::thread::scope(|s| {
+        let chunk_size = (configs.len() + num_threads - 1) / num_threads;
+        let chunks: Vec<&[Config]> = configs.chunks(chunk_size).collect();
+
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let progress = &progress;
+                s.spawn(move || {
+                    let mut local_results = Vec::with_capacity(chunk.len());
+                    for cfg in chunk {
+                        let result = run_config(cfg);
+                        local_results.push(result);
+                        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprint!("\r  Progress: {}/{}", done, total);
+                    }
+                    local_results
+                })
+            })
+            .collect();
+
+        let mut all_results = Vec::with_capacity(total);
+        for handle in handles {
+            all_results.extend(handle.join().unwrap());
+        }
+        all_results
+    });
+
+    eprintln!("\r  Progress: {}/{}  done", total, total);
+
+    // Sort by original insertion order
+    results.sort_by_key(|r| r.order);
 
     // --- Correctness ---
     println!();
