@@ -93,11 +93,31 @@ fn arithmetic_optimized(
     let mut res_b = [0.0f32; BATCH];
     let mut res_a = [0.0f32; BATCH];
 
+    // Pre-check: when k4 <= 0, batches where both inputs have zero alpha
+    // will produce zero (or negative, clamped to zero) output alpha.
+    // The alpha formula is: k1*a1*a2 + k2*a1 + k3*a2 + k4.
+    // When a1=0 and a2=0, this simplifies to just k4.
+    // If k4 <= 0, it clamps to 0, so output alpha is zero.
+    // We can skip the expensive SoA conversion for those batches entirely.
+    let can_skip_transparent = k4 <= 0.0 || k4.approx_zero_ulps(4);
+
     while offset < len {
         let batch_len = (len - offset).min(BATCH);
 
         let s1 = &src1.data[offset..offset + batch_len];
         let s2 = &src2.data[offset..offset + batch_len];
+
+        // Fast skip: when k4 <= 0 and all pixels in the batch have both
+        // source alphas equal to zero, the output alpha is guaranteed zero.
+        // This avoids the costly SoA conversion on transparent regions.
+        if can_skip_transparent {
+            let all_transparent =
+                s1.iter().all(|p| p.a == 0) && s2.iter().all(|p| p.a == 0);
+            if all_transparent {
+                offset += batch_len;
+                continue;
+            }
+        }
 
         // Step 1: Convert AoS u8 pixels to SoA f32 channels (normalized).
         // This scatter/gather loop is inherently scalar due to the AoS input
@@ -133,6 +153,14 @@ fn arithmetic_optimized(
         // Step 3: Clamp alpha to [0, 1].
         for j in 0..batch_len {
             res_a[j] = res_a[j].clamp(0.0, 1.0);
+        }
+
+        // Early exit: if the entire batch has zero alpha after clamping,
+        // skip the write-back (dest is already zeroed).
+        let all_zero = res_a[..batch_len].iter().all(|&a| a.approx_zero_ulps(4));
+        if all_zero {
+            offset += batch_len;
+            continue;
         }
 
         // Step 4: Write results back (SoA -> AoS), with per-pixel alpha-zero
@@ -189,15 +217,6 @@ pub fn arithmetic(
     // All coefficients zero: output is always zero regardless of input.
     if k1 == 0.0 && k2 == 0.0 && k3 == 0.0 && k4 == 0.0 {
         // dest is already zero-initialized by the caller, nothing to do.
-        return;
-    }
-
-    // When k4==0 and at least one of k1/k2/k3 is also zero, many input
-    // combinations produce zero output alpha. The naive path's per-pixel
-    // early-exit on alpha~=0 is optimal here — it skips all channel math
-    // for transparent pixels, which the batched path cannot do.
-    if k4 == 0.0 && (k1 == 0.0 || k2 == 0.0 || k3 == 0.0) {
-        arithmetic_naive(k1, k2, k3, k4, src1, src2, dest);
         return;
     }
 
