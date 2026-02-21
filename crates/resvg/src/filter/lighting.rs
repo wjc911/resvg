@@ -188,7 +188,7 @@ pub fn specular_lighting(
 }
 
 /// The original (naive) specular lighting implementation, preserved verbatim.
-#[allow(dead_code)]
+#[cfg(test)]
 fn specular_lighting_naive(
     fe: &SpecularLighting,
     light_source: LightSource,
@@ -242,9 +242,18 @@ fn specular_lighting_naive(
 /// Optimized specular lighting implementation.
 ///
 /// Key optimizations over the naive version:
-/// 1. Monomorphized (no `dyn Fn` trait object) for better inlining by LLVM
-/// 2. Specular exponent == 1.0 check is done once upfront, not per-pixel
-/// 3. Pre-computed surface_scale / 255.0 factor
+/// 1. **Devirtualization / inlining**: the specular factor computation is a
+///    monomorphized `#[inline] fn` instead of a `dyn Fn` trait-object closure
+///    passed through `apply()`. This lets LLVM inline and optimise the hot path
+///    without indirect-call overhead.
+/// 2. Specular-exponent == 1.0 boolean (`exp_is_one`) is hoisted out of the
+///    per-pixel loop so the branch predictor sees a loop-invariant condition.
+/// 3. `surface_scale / 255.0` is pre-computed once (`scale_factor`) instead of
+///    being recalculated for every pixel.
+///
+/// Note: this is *not* a SIMD or data-layout optimisation. The pixel data is
+/// still in AoS `RGBA8` order and the per-pixel branching prevents
+/// auto-vectorisation.
 fn specular_lighting_optimized(
     fe: &SpecularLighting,
     light_source: LightSource,
@@ -322,6 +331,9 @@ fn specular_lighting_optimized(
     let mut calc = |nx, ny, normal: Normal| {
         match light_source {
             LightSource::DistantLight(_) => {}
+            // Note: PointLight and SpotLight arms are identical but cannot be
+            // merged with an or-pattern because `PointLight` and `SpotLight`
+            // are distinct types — Rust requires a single binding type per arm.
             LightSource::PointLight(ref light) => {
                 let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
                 let origin = Vector3::new(light.x, light.y, light.z);
