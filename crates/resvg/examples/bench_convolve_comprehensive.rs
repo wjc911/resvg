@@ -7,8 +7,12 @@
 //! and special kernels. Compares `apply_naive` vs production `apply`, verifies
 //! bit-exact output, and flags regressions where production is >5% slower.
 //!
+//! Uses multithreading (std::thread::scope) to run benchmark configurations in
+//! parallel across all available CPU cores.
+//!
 //! Usage: cargo run --release --example bench_convolve_comprehensive
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use resvg::filter::convolve_matrix::{apply, apply_naive};
@@ -55,6 +59,7 @@ fn make_test_image(width: u32, height: u32, seed: u8) -> Vec<RGBA8> {
 }
 
 /// Describes a kernel configuration for benchmarking.
+#[derive(Clone)]
 struct KernelConfig {
     name: &'static str,
     cols: u32,
@@ -137,8 +142,19 @@ fn sharpen_3x3() -> KernelConfig {
     }
 }
 
+/// All parameters needed to execute a single benchmark configuration.
+struct Config {
+    order: usize,
+    width: u32,
+    height: u32,
+    kernel: KernelConfig,
+    edge_mode: EdgeMode,
+    preserve_alpha: bool,
+}
+
 /// A single benchmark result row.
 struct BenchResult {
+    order: usize,
     image_size: String,
     kernel: String,
     edge_mode: String,
@@ -195,6 +211,98 @@ fn edge_mode_str(em: EdgeMode) -> &'static str {
     }
 }
 
+/// Execute a single benchmark configuration and return the result.
+fn run_config(config: &Config) -> BenchResult {
+    let kc = &config.kernel;
+    let w = config.width;
+    let h = config.height;
+    let em = config.edge_mode;
+    let pa = config.preserve_alpha;
+
+    let target_x = kc.cols / 2;
+    let target_y = kc.rows / 2;
+
+    let matrix = make_convolve_matrix(
+        kc.cols,
+        kc.rows,
+        target_x,
+        target_y,
+        kc.data.clone(),
+        kc.divisor,
+        kc.bias,
+        em,
+        pa,
+    );
+
+    let iterations = pick_iterations(w, h, kc.cols * kc.rows);
+
+    // --- Naive timing ---
+    let naive_us = {
+        let img_template = make_test_image(w, h, 42);
+        bench_fn(
+            || {
+                let mut img = img_template.clone();
+                apply_naive(&matrix, ImageRefMut::new(w, h, &mut img));
+            },
+            iterations,
+        )
+    };
+
+    // --- Production timing ---
+    let prod_us = {
+        let img_template = make_test_image(w, h, 42);
+        bench_fn(
+            || {
+                let mut img = img_template.clone();
+                apply(&matrix, ImageRefMut::new(w, h, &mut img));
+            },
+            iterations,
+        )
+    };
+
+    // --- Correctness: bit-exact check ---
+    let bit_exact = {
+        let mut img_naive = make_test_image(w, h, 42);
+        let mut img_prod = img_naive.clone();
+        apply_naive(&matrix, ImageRefMut::new(w, h, &mut img_naive));
+        apply(&matrix, ImageRefMut::new(w, h, &mut img_prod));
+        img_naive == img_prod
+    };
+
+    let speedup = naive_us / prod_us;
+    let status = if !bit_exact {
+        "MISMATCH"
+    } else if speedup < 0.95 {
+        "REGRESSION"
+    } else if speedup > 1.05 {
+        "FASTER"
+    } else {
+        "SAME"
+    };
+
+    let kernel_str = if kc.name == "uniform" || kc.name == "identity" {
+        format!("{}x{} {}", kc.cols, kc.rows, kc.name)
+    } else {
+        kc.name.to_string()
+    };
+
+    let dp = dispatch_path(kc.cols, kc.rows, w, h);
+
+    BenchResult {
+        order: config.order,
+        image_size: format!("{}x{}", w, h),
+        kernel: kernel_str,
+        edge_mode: edge_mode_str(em).to_string(),
+        preserve_alpha: pa,
+        dispatch: dp,
+        naive_us,
+        prod_us,
+        speedup,
+        bit_exact,
+        status,
+    }
+}
+
 fn main() {
     let image_sizes: Vec<(u32, u32)> = vec![
         (4, 4),
@@ -208,189 +316,109 @@ fn main() {
     let edge_modes = [EdgeMode::None, EdgeMode::Duplicate, EdgeMode::Wrap];
     let preserve_alphas = [false, true];
 
-    // Build kernel configs for each image size.
-    // Some kernels are size-specific (e.g., 1x1, 2x2, etc.), others are special.
-    struct KernelSpec {
-        make: Box<dyn Fn() -> KernelConfig>,
-    }
-
-    let base_kernels: Vec<KernelSpec> = vec![
+    // Build all kernel configs upfront (no closures needed).
+    let base_kernels: Vec<KernelConfig> = vec![
         // Standard sizes
-        KernelSpec {
-            make: Box::new(|| uniform_kernel(1, 1)),
-        },
-        KernelSpec {
-            make: Box::new(|| uniform_kernel(2, 2)),
-        },
-        KernelSpec {
-            make: Box::new(|| uniform_kernel(3, 3)),
-        },
-        KernelSpec {
-            make: Box::new(|| uniform_kernel(5, 5)),
-        },
-        KernelSpec {
-            make: Box::new(|| uniform_kernel(7, 7)),
-        },
-        KernelSpec {
-            make: Box::new(|| uniform_kernel(9, 9)),
-        },
+        uniform_kernel(1, 1),
+        uniform_kernel(2, 2),
+        uniform_kernel(3, 3),
+        uniform_kernel(5, 5),
+        uniform_kernel(7, 7),
+        uniform_kernel(9, 9),
         // Asymmetric
-        KernelSpec {
-            make: Box::new(|| {
-                let data = vec![1.0; 15];
-                KernelConfig {
-                    name: "uniform_3x5",
-                    cols: 3,
-                    rows: 5,
-                    data,
-                    divisor: 15.0,
-                    bias: 0.0,
-                }
-            }),
+        KernelConfig {
+            name: "uniform_3x5",
+            cols: 3,
+            rows: 5,
+            data: vec![1.0; 15],
+            divisor: 15.0,
+            bias: 0.0,
         },
-        KernelSpec {
-            make: Box::new(|| {
-                let data = vec![1.0; 15];
-                KernelConfig {
-                    name: "uniform_5x3",
-                    cols: 5,
-                    rows: 3,
-                    data,
-                    divisor: 15.0,
-                    bias: 0.0,
-                }
-            }),
+        KernelConfig {
+            name: "uniform_5x3",
+            cols: 5,
+            rows: 3,
+            data: vec![1.0; 15],
+            divisor: 15.0,
+            bias: 0.0,
         },
         // Special kernels
-        KernelSpec {
-            make: Box::new(|| identity_kernel(3, 3)),
-        },
-        KernelSpec {
-            make: Box::new(gaussian_3x3),
-        },
-        KernelSpec {
-            make: Box::new(gaussian_5x5),
-        },
-        KernelSpec {
-            make: Box::new(sobel_x),
-        },
-        KernelSpec {
-            make: Box::new(sharpen_3x3),
-        },
+        identity_kernel(3, 3),
+        gaussian_3x3(),
+        gaussian_5x5(),
+        sobel_x(),
+        sharpen_3x3(),
     ];
 
-    let mut results: Vec<BenchResult> = Vec::new();
-    let mut regression_count = 0u32;
-    let total_combos = image_sizes.len()
-        * base_kernels.len()
-        * edge_modes.len()
-        * preserve_alphas.len();
-    let mut combo_idx = 0usize;
-
-    eprintln!(
-        "Running {} total combinations...\n",
-        total_combos
-    );
+    // --- Build all configurations upfront ---
+    let mut configs: Vec<Config> = Vec::new();
+    let mut order = 0usize;
 
     for &(w, h) in &image_sizes {
-        for kernel_spec in &base_kernels {
-            let kc = (kernel_spec.make)();
-
-            // Skip if target would be invalid (target must be < cols/rows)
-            let target_x = kc.cols / 2;
-            let target_y = kc.rows / 2;
-
+        for kc in &base_kernels {
             for &em in &edge_modes {
                 for &pa in &preserve_alphas {
-                    combo_idx += 1;
-                    if combo_idx % 50 == 0 {
-                        eprintln!("  Progress: {}/{}", combo_idx, total_combos);
-                    }
-
-                    let matrix = make_convolve_matrix(
-                        kc.cols,
-                        kc.rows,
-                        target_x,
-                        target_y,
-                        kc.data.clone(),
-                        kc.divisor,
-                        kc.bias,
-                        em,
-                        pa,
-                    );
-
-                    let iterations = pick_iterations(w, h, kc.cols * kc.rows);
-
-                    // --- Naive timing ---
-                    let naive_us = {
-                        let img_template = make_test_image(w, h, 42);
-                        bench_fn(
-                            || {
-                                let mut img = img_template.clone();
-                                apply_naive(&matrix, ImageRefMut::new(w, h, &mut img));
-                            },
-                            iterations,
-                        )
-                    };
-
-                    // --- Production timing ---
-                    let prod_us = {
-                        let img_template = make_test_image(w, h, 42);
-                        bench_fn(
-                            || {
-                                let mut img = img_template.clone();
-                                apply(&matrix, ImageRefMut::new(w, h, &mut img));
-                            },
-                            iterations,
-                        )
-                    };
-
-                    // --- Correctness: bit-exact check ---
-                    let bit_exact = {
-                        let mut img_naive = make_test_image(w, h, 42);
-                        let mut img_prod = img_naive.clone();
-                        apply_naive(&matrix, ImageRefMut::new(w, h, &mut img_naive));
-                        apply(&matrix, ImageRefMut::new(w, h, &mut img_prod));
-                        img_naive == img_prod
-                    };
-
-                    let speedup = naive_us / prod_us;
-                    let status = if !bit_exact {
-                        "MISMATCH"
-                    } else if speedup < 0.95 {
-                        // Production is >5% slower than naive
-                        regression_count += 1;
-                        "REGRESSION"
-                    } else if speedup > 1.05 {
-                        "FASTER"
-                    } else {
-                        "SAME"
-                    };
-
-                    let kernel_str = if kc.name == "uniform" || kc.name == "identity" {
-                        format!("{}x{} {}", kc.cols, kc.rows, kc.name)
-                    } else {
-                        kc.name.to_string()
-                    };
-
-                    let dp = dispatch_path(kc.cols, kc.rows, w, h);
-
-                    results.push(BenchResult {
-                        image_size: format!("{}x{}", w, h),
-                        kernel: kernel_str,
-                        edge_mode: edge_mode_str(em).to_string(),
+                    configs.push(Config {
+                        order,
+                        width: w,
+                        height: h,
+                        kernel: kc.clone(),
+                        edge_mode: em,
                         preserve_alpha: pa,
-                        dispatch: dp,
-                        naive_us,
-                        prod_us,
-                        speedup,
-                        bit_exact,
-                        status,
                     });
+                    order += 1;
                 }
             }
         }
     }
+
+    let total_combos = configs.len();
+    eprintln!("Running {} total combinations...\n", total_combos);
+
+    // --- Determine parallelism ---
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    eprintln!("Using {} threads\n", num_threads);
+
+    // --- Split configs into chunks and run in parallel ---
+    let progress = AtomicUsize::new(0);
+    let chunk_size = (configs.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<&[Config]> = configs.chunks(chunk_size).collect();
+
+    let mut all_results: Vec<BenchResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let progress_ref = &progress;
+                s.spawn(move || {
+                    let mut thread_results = Vec::with_capacity(chunk.len());
+                    for config in chunk {
+                        let result = run_config(config);
+                        thread_results.push(result);
+
+                        let completed = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        if completed % 50 == 0 {
+                            eprintln!("  Progress: {}/{}", completed, total_combos);
+                        }
+                    }
+                    thread_results
+                })
+            })
+            .collect();
+
+        // Collect results from all threads.
+        let mut merged = Vec::with_capacity(total_combos);
+        for handle in handles {
+            merged.extend(handle.join().unwrap());
+        }
+        merged
+    });
+
+    // --- Sort by original order to get deterministic output ---
+    all_results.sort_by_key(|r| r.order);
+
+    let results = all_results;
 
     // Print results table
     println!();
@@ -501,6 +529,7 @@ fn main() {
         );
     }
 
+    let regression_count = results.iter().filter(|r| r.status == "REGRESSION").count();
     if regression_count > 0 {
         std::process::exit(1);
     }
