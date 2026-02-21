@@ -21,18 +21,39 @@ fn build_lut(func: &TransferFunction) -> Lut {
     lut
 }
 
+/// Returns the LUT threshold (minimum pixel count) for a given transfer function.
+///
+/// The LUT approach pre-computes 256 entries, which has a fixed setup cost that
+/// varies by function type. The per-pixel savings must amortize this cost.
+///
+/// Benchmarked thresholds:
+/// - **Gamma** (`powf`): ~30 us to build LUT; breaks even at ~256 pixels.
+/// - **Table / Discrete**: ~18-25 us to build; breaks even at ~1024 pixels.
+/// - **Linear**: ~6 us to build, but per-pixel cost is very low (multiply + add);
+///   LUT only wins at ~2048 pixels.
+fn lut_threshold(func: &TransferFunction) -> usize {
+    match func {
+        TransferFunction::Identity => usize::MAX, // never build a LUT
+        TransferFunction::Gamma { .. } => 256,
+        TransferFunction::Table(_) | TransferFunction::Discrete(_) => 1024,
+        TransferFunction::Linear { .. } => 2048,
+    }
+}
+
 /// Applies component transfer functions for each `src` image channel.
 ///
 /// Input image pixels should have an **unpremultiplied alpha**.
 ///
 /// This implementation pre-computes a 256-entry lookup table for each
-/// non-identity channel. This eliminates expensive per-pixel operations
-/// (especially `powf` in the Gamma case) by replacing them with a single
-/// table lookup per pixel per channel.
+/// non-identity channel when the image is large enough for the LUT setup
+/// cost to be amortized. The threshold varies by transfer function type:
 ///
-/// For very small images (fewer than 256 pixels), the LUT setup cost
-/// (up to 1024 `transfer_scalar()` calls) exceeds the per-pixel savings,
-/// so we fall back to direct per-pixel `transfer_scalar()` calls.
+/// - **Gamma** (expensive `powf`): LUT at >= 256 pixels
+/// - **Table / Discrete**: LUT at >= 1024 pixels
+/// - **Linear** (cheap multiply-add): LUT at >= 2048 pixels
+///
+/// For images below the threshold, direct per-pixel `transfer_scalar()` calls
+/// are used, avoiding the fixed LUT construction overhead.
 pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
     let func_r = fe.func_r();
     let func_g = fe.func_g();
@@ -49,10 +70,22 @@ pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
         return;
     }
 
-    // For small images, the LUT setup cost (256 transfer_scalar() calls per
-    // active channel) exceeds the per-pixel savings. Fall back to direct
-    // per-pixel computation.
-    if src.data.len() < 256 {
+    let pixel_count = src.data.len();
+
+    // Determine per-channel: use LUT or direct based on function-specific threshold.
+    let use_lut_r = r_active && pixel_count >= lut_threshold(func_r);
+    let use_lut_g = g_active && pixel_count >= lut_threshold(func_g);
+    let use_lut_b = b_active && pixel_count >= lut_threshold(func_b);
+    let use_lut_a = a_active && pixel_count >= lut_threshold(func_a);
+
+    let any_lut = use_lut_r || use_lut_g || use_lut_b || use_lut_a;
+    let any_direct = (r_active && !use_lut_r)
+        || (g_active && !use_lut_g)
+        || (b_active && !use_lut_b)
+        || (a_active && !use_lut_a);
+
+    // Pure direct path: no channel benefits from LUT at this size.
+    if !any_lut {
         for pixel in src.data {
             if r_active {
                 pixel.r = transfer_scalar(func_r, pixel.r);
@@ -70,34 +103,65 @@ pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
         return;
     }
 
-    // Pre-compute LUTs only for active channels.
-    let lut_r = if r_active {
+    // Build LUTs for channels that benefit; use identity LUT for others.
+    let lut_r = if use_lut_r {
         build_lut(func_r)
     } else {
         IDENTITY_LUT
     };
-    let lut_g = if g_active {
+    let lut_g = if use_lut_g {
         build_lut(func_g)
     } else {
         IDENTITY_LUT
     };
-    let lut_b = if b_active {
+    let lut_b = if use_lut_b {
         build_lut(func_b)
     } else {
         IDENTITY_LUT
     };
-    let lut_a = if a_active {
+    let lut_a = if use_lut_a {
         build_lut(func_a)
     } else {
         IDENTITY_LUT
     };
 
-    // Apply LUTs. Table lookups are gather operations that prevent
-    // auto-vectorization, but they still outperform per-pixel floating-point
-    // arithmetic (especially `powf`) for images with >= 256 pixels.
-    // When only some channels are active, the identity LUT is a no-op in
-    // terms of correctness (lut[x] == x for identity), so we can always
-    // apply all four without branching in the hot loop.
+    // Hybrid path: some channels use LUT, others use direct computation.
+    if any_direct {
+        for pixel in src.data {
+            pixel.r = if use_lut_r {
+                lut_r[pixel.r as usize]
+            } else if r_active {
+                transfer_scalar(func_r, pixel.r)
+            } else {
+                pixel.r
+            };
+            pixel.g = if use_lut_g {
+                lut_g[pixel.g as usize]
+            } else if g_active {
+                transfer_scalar(func_g, pixel.g)
+            } else {
+                pixel.g
+            };
+            pixel.b = if use_lut_b {
+                lut_b[pixel.b as usize]
+            } else if b_active {
+                transfer_scalar(func_b, pixel.b)
+            } else {
+                pixel.b
+            };
+            pixel.a = if use_lut_a {
+                lut_a[pixel.a as usize]
+            } else if a_active {
+                transfer_scalar(func_a, pixel.a)
+            } else {
+                pixel.a
+            };
+        }
+        return;
+    }
+
+    // Pure LUT path: all active channels use LUT lookups.
+    // The identity LUT handles inactive channels (lut[x] == x).
     for pixel in src.data {
         pixel.r = lut_r[pixel.r as usize];
         pixel.g = lut_g[pixel.g as usize];
