@@ -330,6 +330,7 @@ struct GradientTable {
 }
 
 /// Optimized init: produces flat arrays instead of nested Vecs.
+#[inline(never)]
 fn init_optimized(mut seed: i32) -> ([usize; B_LEN], GradientTable) {
     let mut lattice_selector = [0usize; B_LEN];
     let mut gradient = GradientTable {
@@ -495,6 +496,7 @@ fn turbulence_4ch(
     sums
 }
 
+#[inline(never)]
 fn apply_optimized(
     offset_x: f64,
     offset_y: f64,
