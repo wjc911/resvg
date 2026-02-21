@@ -234,6 +234,23 @@ pub struct ComponentTransfer {
 }
 
 impl ComponentTransfer {
+    /// Creates a new `ComponentTransfer` with the given transfer functions.
+    pub fn new(
+        input: Input,
+        func_r: TransferFunction,
+        func_g: TransferFunction,
+        func_b: TransferFunction,
+        func_a: TransferFunction,
+    ) -> Self {
+        ComponentTransfer {
+            input,
+            func_r,
+            func_g,
+            func_b,
+            func_a,
+        }
+    }
+
     /// Identifies input for the given filter primitive.
     ///
     /// `in` in the SVG.
