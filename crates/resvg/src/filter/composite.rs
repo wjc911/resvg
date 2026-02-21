@@ -9,8 +9,9 @@ use usvg::ApproxZeroUlps;
 /// For very small images, the overhead of the optimized path is not worthwhile.
 const OPTIMIZED_CROSSOVER: usize = 64;
 
-/// Batch size for the optimized path. Must be large enough for LLVM to
-/// auto-vectorize the inner loops, but small enough to stay in L1 cache.
+/// Batch size for the optimized path. Must be large enough to amortize
+/// per-batch overhead and give LLVM a chance to auto-vectorize the
+/// arithmetic loops, but small enough to stay in L1 cache.
 /// 64 pixels * 4 channels * 4 bytes = 1 KiB per buffer, well within L1.
 const BATCH: usize = 64;
 
@@ -51,13 +52,15 @@ fn arithmetic_naive(
     }
 }
 
-/// Optimized arithmetic composition using batch `[f32; 4]` processing.
+/// Optimized arithmetic composition using SoA batch processing.
 ///
-/// Processes pixels in fixed-size batches. Within each batch, the arithmetic
-/// formula is applied to all channels using separate `[f32; BATCH]` arrays for
-/// each channel, enabling LLVM auto-vectorization. The conversion and clamping
-/// steps are also batched for better instruction-level parallelism and cache
-/// utilization.
+/// Processes pixels in fixed-size batches using separate `[f32; BATCH]` arrays
+/// per channel (Structure-of-Arrays layout). The SoA layout enables potential
+/// LLVM auto-vectorization of the arithmetic loops (Step 2), though the
+/// AoS-to-SoA conversion (Step 1), SoA-to-AoS write-back (Step 4), and the
+/// per-pixel alpha-zero branch are inherently scalar. The main benefit is
+/// better instruction-level parallelism and cache locality for the arithmetic
+/// computation.
 fn arithmetic_optimized(
     k1: f32,
     k2: f32,
@@ -73,9 +76,9 @@ fn arithmetic_optimized(
     // Precompute reciprocal to avoid per-pixel division.
     const INV_255: f32 = 1.0 / 255.0;
 
-    // Scratch buffers for batch processing — one per channel.
-    // Using separate arrays per channel (SoA layout) enables LLVM to
-    // vectorize the inner computation loops as straight-line SIMD.
+    // Scratch buffers for batch processing — one per channel (SoA layout).
+    // Separating channels into contiguous arrays allows the arithmetic
+    // loops (Step 2) to be candidates for LLVM auto-vectorization.
     let mut r1 = [0.0f32; BATCH];
     let mut g1 = [0.0f32; BATCH];
     let mut b1 = [0.0f32; BATCH];
@@ -97,7 +100,8 @@ fn arithmetic_optimized(
         let s2 = &src2.data[offset..offset + batch_len];
 
         // Step 1: Convert AoS u8 pixels to SoA f32 channels (normalized).
-        // This loop is simple and predictable — LLVM vectorizes it well.
+        // This scatter/gather loop is inherently scalar due to the AoS input
+        // layout, but is simple and predictable for the CPU's load pipeline.
         for j in 0..batch_len {
             r1[j] = s1[j].r as f32 * INV_255;
             g1[j] = s1[j].g as f32 * INV_255;
@@ -111,7 +115,8 @@ fn arithmetic_optimized(
         }
 
         // Step 2: Apply arithmetic formula per channel — no branches, pure math.
-        // Each of these 4 loops is a perfect auto-vectorization candidate.
+        // These branchless loops over contiguous f32 arrays are candidates for
+        // LLVM auto-vectorization (the SoA layout is what makes this possible).
         for j in 0..batch_len {
             res_r[j] = k1 * r1[j] * r2[j] + k2 * r1[j] + k3 * r2[j] + k4;
         }
@@ -125,17 +130,14 @@ fn arithmetic_optimized(
             res_a[j] = k1 * a1[j] * a2[j] + k2 * a1[j] + k3 * a2[j] + k4;
         }
 
-        // Step 3: Clamp alpha to [0, 1] — branchless-friendly.
+        // Step 3: Clamp alpha to [0, 1].
         for j in 0..batch_len {
-            if res_a[j] > 1.0 {
-                res_a[j] = 1.0;
-            } else if res_a[j] < 0.0 {
-                res_a[j] = 0.0;
-            }
+            res_a[j] = res_a[j].clamp(0.0, 1.0);
         }
 
-        // Step 4: Write results back, with per-pixel alpha-zero check.
-        // This scalar loop handles the conditional write and premultiplied clamp.
+        // Step 4: Write results back (SoA -> AoS), with per-pixel alpha-zero
+        // check. This loop is inherently scalar due to the conditional branch
+        // and the interleaved AoS store.
         let dest_slice = &mut dest.data[offset..offset + batch_len];
         for j in 0..batch_len {
             let a = res_a[j];
@@ -158,14 +160,7 @@ fn arithmetic_optimized(
 /// Clamp `val` to `[0, max]` and scale to `[0, 255]` as `u8`.
 #[inline(always)]
 fn clamp_and_scale(val: f32, max: f32) -> u8 {
-    let clamped = if val > max {
-        max
-    } else if val < 0.0 {
-        0.0
-    } else {
-        val
-    };
-    (clamped * 255.0) as u8
+    (val.clamp(0.0, max) * 255.0) as u8
 }
 
 /// Performs an arithmetic composition.
@@ -187,6 +182,24 @@ pub fn arithmetic(
 ) {
     assert!(src1.width == src2.width && src1.width == dest.width);
     assert!(src1.height == src2.height && src1.height == dest.height);
+
+    // Fast path for degenerate k-values — checked before the pixel-count
+    // crossover so we never do unnecessary batch work.
+
+    // All coefficients zero: output is always zero regardless of input.
+    if k1 == 0.0 && k2 == 0.0 && k3 == 0.0 && k4 == 0.0 {
+        // dest is already zero-initialized by the caller, nothing to do.
+        return;
+    }
+
+    // When k4==0 and at least one of k1/k2/k3 is also zero, many input
+    // combinations produce zero output alpha. The naive path's per-pixel
+    // early-exit on alpha~=0 is optimal here — it skips all channel math
+    // for transparent pixels, which the batched path cannot do.
+    if k4 == 0.0 && (k1 == 0.0 || k2 == 0.0 || k3 == 0.0) {
+        arithmetic_naive(k1, k2, k3, k4, src1, src2, dest);
+        return;
+    }
 
     let pixel_count = src1.data.len();
     if pixel_count < OPTIMIZED_CROSSOVER {
