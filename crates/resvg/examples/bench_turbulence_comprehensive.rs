@@ -14,6 +14,7 @@
 //! - Seeds: 0, 42, -7
 
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -608,7 +609,9 @@ struct BenchConfig {
     seed: i32,
 }
 
+#[allow(dead_code)]
 struct BenchResult {
+    order: usize,
     config: String,
     size_label: String,
     octaves: u32,
@@ -619,6 +622,21 @@ struct BenchResult {
     opt_us: f64,
     speedup: f64,
     regression: bool,
+}
+
+/// A group of BenchConfig entries (one per seed) that share the same
+/// size/octaves/mode/stitch/freq. Results from each seed are averaged
+/// into a single BenchResult.
+struct AggregatedConfig {
+    order: usize,
+    width: u32,
+    height: u32,
+    octaves: u32,
+    fractal_noise: bool,
+    stitch_tiles: bool,
+    base_freq_x: f64,
+    base_freq_y: f64,
+    seeds: Vec<i32>,
 }
 
 fn make_image(w: u32, h: u32) -> Vec<Pixel> {
@@ -633,7 +651,8 @@ fn make_image(w: u32, h: u32) -> Vec<Pixel> {
     ]
 }
 
-fn bench_one(cfg: &BenchConfig) -> BenchResult {
+/// Returns (naive_us, opt_us) timing for a single seed configuration.
+fn bench_one_timing(cfg: &BenchConfig) -> (f64, f64) {
     let pixels = cfg.width as u64 * cfg.height as u64;
 
     // Choose iteration count to get meaningful timing
@@ -737,35 +756,63 @@ fn bench_one(cfg: &BenchConfig) -> BenchResult {
     }
     let opt_us = start.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
 
-    let speedup = naive_us / opt_us;
-    let regression = speedup < 0.95; // flag if optimized is >5% slower
+    (naive_us, opt_us)
+}
 
-    let size_label = format!("{}x{}", cfg.width, cfg.height);
-    let mode = if cfg.fractal_noise {
+/// Run all seeds for an AggregatedConfig, average them, and produce a BenchResult.
+fn bench_aggregated(acfg: &AggregatedConfig) -> BenchResult {
+    let mut naive_sum = 0.0;
+    let mut opt_sum = 0.0;
+
+    for &seed in &acfg.seeds {
+        let cfg = BenchConfig {
+            width: acfg.width,
+            height: acfg.height,
+            octaves: acfg.octaves,
+            fractal_noise: acfg.fractal_noise,
+            stitch_tiles: acfg.stitch_tiles,
+            base_freq_x: acfg.base_freq_x,
+            base_freq_y: acfg.base_freq_y,
+            seed,
+        };
+        let (n, o) = bench_one_timing(&cfg);
+        naive_sum += n;
+        opt_sum += o;
+    }
+
+    let num_seeds = acfg.seeds.len() as f64;
+    let naive_avg = naive_sum / num_seeds;
+    let opt_avg = opt_sum / num_seeds;
+    let speedup = naive_avg / opt_avg;
+    let regression = speedup < 0.95;
+
+    let size_label = format!("{}x{}", acfg.width, acfg.height);
+    let mode = if acfg.fractal_noise {
         "fractalNoise"
     } else {
         "turbulence"
     };
-    let stitch = if cfg.stitch_tiles { "on" } else { "off" };
-    let freq_label = if (cfg.base_freq_x - cfg.base_freq_y).abs() < 1e-9 {
-        format!("{:.2}", cfg.base_freq_x)
+    let stitch = if acfg.stitch_tiles { "on" } else { "off" };
+    let freq_label = if (acfg.base_freq_x - acfg.base_freq_y).abs() < 1e-9 {
+        format!("{:.2}", acfg.base_freq_x)
     } else {
-        format!("({:.2},{:.2})", cfg.base_freq_x, cfg.base_freq_y)
+        format!("({:.2},{:.2})", acfg.base_freq_x, acfg.base_freq_y)
     };
     let config = format!(
-        "{}x{} oct={} {} stitch={} freq={} seed={}",
-        cfg.width, cfg.height, cfg.octaves, mode, stitch, freq_label, cfg.seed
+        "{}x{} oct={} {} stitch={} freq={}",
+        acfg.width, acfg.height, acfg.octaves, mode, stitch, freq_label
     );
 
     BenchResult {
+        order: acfg.order,
         config,
         size_label,
-        octaves: cfg.octaves,
+        octaves: acfg.octaves,
         mode,
         stitch,
         freq_label,
-        naive_us,
-        opt_us,
+        naive_us: naive_avg,
+        opt_us: opt_avg,
         speedup,
         regression,
     }
@@ -789,7 +836,7 @@ fn main() {
         (0.1, 0.1),
         (0.05, 0.01), // asymmetric
     ];
-    let seeds: &[i32] = &[0, 42, -7];
+    let seeds: Vec<i32> = vec![0, 42, -7];
 
     // First, verify correctness for a representative subset
     println!("=== Correctness verification ===\n");
@@ -799,7 +846,7 @@ fn main() {
             for &fractal in modes {
                 for &stitch in stitching {
                     for &(bfx, bfy) in freq_pairs {
-                        for &seed in seeds {
+                        for &seed in &seeds {
                             let mut naive_buf = make_image(w, h);
                             let mut opt_buf = make_image(w, h);
                             apply_naive(
@@ -834,9 +881,34 @@ fn main() {
     // Now run the comprehensive benchmark
     println!("=== Comprehensive feTurbulence Benchmark (naive vs optimized) ===\n");
 
-    // Count total tests
-    let total =
-        sizes.len() * octaves_list.len() * modes.len() * stitching.len() * freq_pairs.len() * seeds.len();
+    // Build all aggregated configurations upfront
+    let mut configs: Vec<AggregatedConfig> = Vec::new();
+    let mut order = 0usize;
+    for &(w, h) in sizes {
+        for &octaves in octaves_list {
+            for &fractal_noise in modes {
+                for &stitch_tiles in stitching {
+                    for &(bfx, bfy) in freq_pairs {
+                        configs.push(AggregatedConfig {
+                            order,
+                            width: w,
+                            height: h,
+                            octaves,
+                            fractal_noise,
+                            stitch_tiles,
+                            base_freq_x: bfx,
+                            base_freq_y: bfy,
+                            seeds: seeds.clone(),
+                        });
+                        order += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Count total individual seed tests
+    let total = configs.len() * seeds.len();
     println!(
         "Total configurations: {} ({} sizes x {} octaves x {} modes x {} stitch x {} freqs x {} seeds)\n",
         total,
@@ -848,6 +920,59 @@ fn main() {
         seeds.len()
     );
 
+    // Determine thread count
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    println!(
+        "Running with {} threads across {} aggregated configs\n",
+        num_threads,
+        configs.len()
+    );
+
+    // Progress counter shared across threads
+    let progress = AtomicUsize::new(0);
+    let total_configs = configs.len();
+
+    // Split configs into chunks, one per thread
+    let chunk_size = (configs.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<&[AggregatedConfig]> = configs.chunks(chunk_size).collect();
+
+    // Execute in parallel using scoped threads
+    let mut all_results: Vec<BenchResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let progress_ref = &progress;
+                s.spawn(move || {
+                    let mut thread_results = Vec::with_capacity(chunk.len());
+                    for acfg in chunk {
+                        let result = bench_aggregated(acfg);
+                        thread_results.push(result);
+                        let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprint!(
+                            "\r  Progress: {}/{} aggregated configs complete...",
+                            done, total_configs
+                        );
+                    }
+                    thread_results
+                })
+            })
+            .collect();
+
+        // Collect results from all threads
+        let mut merged: Vec<BenchResult> = Vec::with_capacity(total_configs);
+        for handle in handles {
+            merged.extend(handle.join().expect("worker thread panicked"));
+        }
+        merged
+    });
+
+    eprintln!(); // newline after progress
+
+    // Sort by original order to restore deterministic output
+    all_results.sort_by_key(|r| r.order);
+
     // Print header
     println!(
         "{:<12} | {:>7} | {:<12} | {:>6} | {:>12} | {:>12} | {:>12} | {:>8}",
@@ -855,110 +980,64 @@ fn main() {
     );
     println!("{}", "-".repeat(103));
 
-    let mut results: Vec<BenchResult> = Vec::new();
     let mut regressions: Vec<String> = Vec::new();
 
-    for &(w, h) in sizes {
-        for &octaves in octaves_list {
-            for &fractal_noise in modes {
-                for &stitch_tiles in stitching {
-                    for &(bfx, bfy) in freq_pairs {
-                        // For each size/octave/mode/stitch/freq combination, average over seeds
-                        let mut naive_sum = 0.0;
-                        let mut opt_sum = 0.0;
+    // Print results with size-group separators
+    let mut last_size_group: Option<usize> = None;
+    for r in &all_results {
+        // Determine size_group from the size_label
+        let current_group = sizes
+            .iter()
+            .position(|&(w, h)| format!("{}x{}", w, h) == r.size_label)
+            .unwrap_or(0);
 
-                        for &seed in seeds {
-                            let cfg = BenchConfig {
-                                width: w,
-                                height: h,
-                                octaves,
-                                fractal_noise,
-                                stitch_tiles,
-                                base_freq_x: bfx,
-                                base_freq_y: bfy,
-                                seed,
-                            };
-                            let r = bench_one(&cfg);
-                            naive_sum += r.naive_us;
-                            opt_sum += r.opt_us;
-                        }
-
-                        let naive_avg = naive_sum / seeds.len() as f64;
-                        let opt_avg = opt_sum / seeds.len() as f64;
-                        let speedup = naive_avg / opt_avg;
-                        let regression = speedup < 0.95;
-
-                        let size_label = format!("{}x{}", w, h);
-                        let mode = if fractal_noise {
-                            "fractalNoise"
-                        } else {
-                            "turbulence"
-                        };
-                        let stitch_str = if stitch_tiles { "on" } else { "off" };
-                        let freq_label = if (bfx - bfy).abs() < 1e-9 {
-                            format!("{:.2}", bfx)
-                        } else {
-                            format!("({:.2},{:.2})", bfx, bfy)
-                        };
-
-                        let flag = if regression { " <<<REGRESSION" } else { "" };
-                        println!(
-                            "{:<12} | {:>7} | {:<12} | {:>6} | {:>12} | {:>12.1} | {:>12.1} | {:>7.2}x{}",
-                            size_label, octaves, mode, stitch_str, freq_label, naive_avg, opt_avg, speedup, flag
-                        );
-
-                        if regression {
-                            let msg = format!(
-                                "{}x{} oct={} {} stitch={} freq={}: speedup={:.2}x (REGRESSION)",
-                                w, h, octaves, mode, stitch_str, freq_label, speedup
-                            );
-                            regressions.push(msg);
-                        }
-
-                        results.push(BenchResult {
-                            config: format!(
-                                "{}x{} oct={} {} stitch={} freq={}",
-                                w, h, octaves, mode, stitch_str, freq_label
-                            ),
-                            size_label,
-                            octaves,
-                            mode,
-                            stitch: stitch_str,
-                            freq_label,
-                            naive_us: naive_avg,
-                            opt_us: opt_avg,
-                            speedup,
-                            regression,
-                        });
-                    }
-                }
+        // Print separator when size group changes (but not before the first group)
+        if let Some(prev) = last_size_group {
+            if current_group != prev {
+                println!("{}", "-".repeat(103));
             }
         }
-        println!("{}", "-".repeat(103));
+        last_size_group = Some(current_group);
+
+        let flag = if r.regression { " <<<REGRESSION" } else { "" };
+        println!(
+            "{:<12} | {:>7} | {:<12} | {:>6} | {:>12} | {:>12.1} | {:>12.1} | {:>7.2}x{}",
+            r.size_label, r.octaves, r.mode, r.stitch, r.freq_label, r.naive_us, r.opt_us,
+            r.speedup, flag
+        );
+
+        if r.regression {
+            let msg = format!(
+                "{} oct={} {} stitch={} freq={}: speedup={:.2}x (REGRESSION)",
+                r.size_label, r.octaves, r.mode, r.stitch, r.freq_label, r.speedup
+            );
+            regressions.push(msg);
+        }
     }
+    println!("{}", "-".repeat(103));
 
     // Summary statistics
     println!("\n=== Summary ===\n");
-    let total_configs = results.len();
-    let num_regressions = results.iter().filter(|r| r.regression).count();
-    let min_speedup = results
+    let result_count = all_results.len();
+    let num_regressions = all_results.iter().filter(|r| r.regression).count();
+    let min_speedup = all_results
         .iter()
         .map(|r| r.speedup)
         .fold(f64::INFINITY, f64::min);
-    let max_speedup = results
+    let max_speedup = all_results
         .iter()
         .map(|r| r.speedup)
         .fold(f64::NEG_INFINITY, f64::max);
     let avg_speedup: f64 =
-        results.iter().map(|r| r.speedup).sum::<f64>() / total_configs as f64;
+        all_results.iter().map(|r| r.speedup).sum::<f64>() / result_count as f64;
 
-    println!("Total configurations tested: {}", total_configs);
+    println!("Total configurations tested: {}", result_count);
     println!("Min speedup: {:.2}x", min_speedup);
     println!("Max speedup: {:.2}x", max_speedup);
     println!("Avg speedup: {:.2}x", avg_speedup);
     println!(
         "Regressions (>5% slower): {}/{}",
-        num_regressions, total_configs
+        num_regressions, result_count
     );
 
     if !regressions.is_empty() {
@@ -974,7 +1053,7 @@ fn main() {
     println!("\n=== Per-size average speedup ===\n");
     for &(w, h) in sizes {
         let label = format!("{}x{}", w, h);
-        let size_results: Vec<_> = results.iter().filter(|r| r.size_label == label).collect();
+        let size_results: Vec<_> = all_results.iter().filter(|r| r.size_label == label).collect();
         let avg: f64 = size_results.iter().map(|r| r.speedup).sum::<f64>()
             / size_results.len() as f64;
         let min = size_results
@@ -994,7 +1073,7 @@ fn main() {
     // Per-octave summary
     println!("\n=== Per-octave average speedup ===\n");
     for &oct in octaves_list {
-        let oct_results: Vec<_> = results.iter().filter(|r| r.octaves == oct).collect();
+        let oct_results: Vec<_> = all_results.iter().filter(|r| r.octaves == oct).collect();
         let avg: f64 =
             oct_results.iter().map(|r| r.speedup).sum::<f64>() / oct_results.len() as f64;
         println!("  octaves={}: avg={:.2}x", oct, avg);
