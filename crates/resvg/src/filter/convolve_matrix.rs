@@ -30,7 +30,7 @@ pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
 
 /// The original naive implementation, used as fallback for trivial cases (1x1 kernels,
 /// kernels larger than the image) where the optimized path has unnecessary overhead.
-fn apply_naive(matrix: &ConvolveMatrix, src: ImageRefMut) {
+pub fn apply_naive(matrix: &ConvolveMatrix, src: ImageRefMut) {
     fn bound(min: i32, val: i32, max: i32) -> i32 {
         core::cmp::max(min, core::cmp::min(max, val))
     }
@@ -134,7 +134,7 @@ fn apply_naive(matrix: &ConvolveMatrix, src: ImageRefMut) {
 /// Note: true SIMD auto-vectorization is still limited by the AoS pixel layout
 /// (interleaved R,G,B,A) and dynamic kernel sizes, but hoisting the preserve_alpha
 /// branch out of the inner loop removes one obstacle.
-fn apply_general(matrix: &ConvolveMatrix, src: ImageRefMut) {
+pub fn apply_general(matrix: &ConvolveMatrix, src: ImageRefMut) {
     let width = src.width;
     let height = src.height;
     let width_i = width as i32;
