@@ -8,11 +8,15 @@
 //! asymmetric sigma configurations. Also tests around the 16x16 threshold
 //! where the code switches between naive and optimized paths.
 //!
+//! Uses multithreading (std::thread::scope) to run independent benchmark
+//! configurations in parallel across all available CPU cores.
+//!
 //! Run with: cargo run -p resvg --release --example bench_blur_comprehensive
 
 #![allow(clippy::needless_range_loop)]
 
 use rgb::RGBA8;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ---- Inline the necessary types so the bench can call blur directly ----
@@ -877,7 +881,65 @@ fn make_random_alpha(width: u32, height: u32) -> Vec<RGBA8> {
 // Benchmark harness
 // ===========================================================================
 
+/// Which blur algorithm pair to benchmark (naive vs optimized).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Algorithm {
+    Box,
+    Iir,
+}
+
+/// Which input pattern to generate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputPattern {
+    Opaque,
+    Gradient,
+    Random,
+}
+
+impl InputPattern {
+    fn name(self) -> &'static str {
+        match self {
+            InputPattern::Opaque => "opaque",
+            InputPattern::Gradient => "gradient",
+            InputPattern::Random => "random",
+        }
+    }
+
+    fn generate(self, width: u32, height: u32) -> Vec<RGBA8> {
+        match self {
+            InputPattern::Opaque => make_opaque(width, height),
+            InputPattern::Gradient => make_gradient_alpha(width, height),
+            InputPattern::Random => make_random_alpha(width, height),
+        }
+    }
+}
+
+/// Which section of the output this result belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    BoxBlur,
+    IirBlur,
+    AsymmetricSigma,
+    ThresholdBoundary,
+}
+
+/// A single benchmark configuration to run.
+struct Config {
+    order: usize,
+    section: Section,
+    width: u32,
+    height: u32,
+    sigma_x: f64,
+    sigma_y: f64,
+    pattern: InputPattern,
+    algorithm: Algorithm,
+    /// Display label for the algorithm column.
+    algorithm_label: String,
+}
+
 struct BenchResult {
+    order: usize,
+    section: Section,
     image_size: String,
     sigma: String,
     input_pattern: String,
@@ -924,9 +986,65 @@ fn choose_iters(width: u32, height: u32) -> u32 {
     }
 }
 
+/// Run a single benchmark configuration and return the result.
+fn run_config(config: &Config, progress: &AtomicUsize, total: usize) -> BenchResult {
+    let data_template = config.pattern.generate(config.width, config.height);
+    let iters = choose_iters(config.width, config.height);
+
+    let (naive_fn, opt_fn): (
+        &dyn Fn(f64, f64, ImageRefMut),
+        &dyn Fn(f64, f64, ImageRefMut),
+    ) = match config.algorithm {
+        Algorithm::Box => (&box_blur_naive::apply, &box_blur_opt::apply),
+        Algorithm::Iir => (&iir_blur_naive::apply, &iir_blur_opt::apply),
+    };
+
+    let t_naive = bench_one_fn(
+        &data_template,
+        config.width,
+        config.height,
+        config.sigma_x,
+        config.sigma_y,
+        naive_fn,
+        iters,
+    );
+    let t_opt = bench_one_fn(
+        &data_template,
+        config.width,
+        config.height,
+        config.sigma_x,
+        config.sigma_y,
+        opt_fn,
+        iters,
+    );
+    let speedup = t_naive / t_opt;
+
+    let size_str = format!("{}x{}", config.width, config.height);
+    let sigma_str = if config.sigma_x == config.sigma_y {
+        format!("{}", config.sigma_x)
+    } else {
+        format!("({},{})", config.sigma_x, config.sigma_y)
+    };
+
+    let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+    eprint!("\r  Progress: {}/{} configurations completed...", done, total);
+
+    BenchResult {
+        order: config.order,
+        section: config.section,
+        image_size: size_str,
+        sigma: sigma_str,
+        input_pattern: config.pattern.name().to_string(),
+        algorithm: config.algorithm_label.clone(),
+        naive_us: t_naive,
+        opt_us: t_opt,
+        speedup,
+    }
+}
+
 fn main() {
     // =====================================================================
-    // Part 1: Correctness verification
+    // Part 1: Correctness verification (sequential -- fast, has dependencies)
     // =====================================================================
     println!("=== Correctness Verification ===\n");
 
@@ -1031,7 +1149,7 @@ fn main() {
     }
 
     // =====================================================================
-    // Part 2: Comprehensive performance benchmark
+    // Part 2: Comprehensive performance benchmark (parallel)
     // =====================================================================
     println!("\n=== Comprehensive Performance Benchmark ===\n");
 
@@ -1052,200 +1170,14 @@ fn main() {
     let box_sigmas: &[f64] = &[2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0];
     let iir_sigmas: &[f64] = &[0.3, 0.5, 1.0, 1.5, 1.9];
 
-    let input_patterns: &[(&str, fn(u32, u32) -> Vec<RGBA8>)] = &[
-        ("opaque", make_opaque),
-        ("gradient", make_gradient_alpha),
-        ("random", make_random_alpha),
+    let input_patterns: &[InputPattern] = &[
+        InputPattern::Opaque,
+        InputPattern::Gradient,
+        InputPattern::Random,
     ];
-
-    let mut box_results: Vec<BenchResult> = Vec::new();
-    let mut iir_results: Vec<BenchResult> = Vec::new();
-
-    // ----- Box Blur Benchmark -----
-    println!("--- Box Blur Benchmark ---");
-    println!(
-        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(80));
-
-    for &(w, h) in image_sizes {
-        for &sigma in box_sigmas {
-            for &(pat_name, pat_fn) in input_patterns {
-                let data_template = pat_fn(w, h);
-                let iters = choose_iters(w, h);
-
-                let t_naive = bench_one_fn(
-                    &data_template,
-                    w,
-                    h,
-                    sigma,
-                    sigma,
-                    &box_blur_naive::apply,
-                    iters,
-                );
-                let t_opt = bench_one_fn(
-                    &data_template,
-                    w,
-                    h,
-                    sigma,
-                    sigma,
-                    &box_blur_opt::apply,
-                    iters,
-                );
-                let speedup = t_naive / t_opt;
-
-                let size_str = format!("{}x{}", w, h);
-                let sigma_str = format!("{}", sigma);
-
-                let regression_marker = if speedup < 0.95 { " *** REGRESSION" } else { "" };
-                println!(
-                    "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
-                    size_str, sigma_str, pat_name, "box", t_naive, t_opt, speedup, regression_marker
-                );
-
-                box_results.push(BenchResult {
-                    image_size: size_str,
-                    sigma: sigma_str,
-                    input_pattern: pat_name.to_string(),
-                    algorithm: "box".to_string(),
-                    naive_us: t_naive,
-                    opt_us: t_opt,
-                    speedup,
-                });
-            }
-        }
-    }
-
-    // ----- IIR Blur Benchmark -----
-    println!("\n--- IIR Blur Benchmark ---");
-    println!(
-        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(80));
-
-    for &(w, h) in image_sizes {
-        for &sigma in iir_sigmas {
-            for &(pat_name, pat_fn) in input_patterns {
-                let data_template = pat_fn(w, h);
-                let iters = choose_iters(w, h);
-
-                let t_naive = bench_one_fn(
-                    &data_template,
-                    w,
-                    h,
-                    sigma,
-                    sigma,
-                    &iir_blur_naive::apply,
-                    iters,
-                );
-                let t_opt = bench_one_fn(
-                    &data_template,
-                    w,
-                    h,
-                    sigma,
-                    sigma,
-                    &iir_blur_opt::apply,
-                    iters,
-                );
-                let speedup = t_naive / t_opt;
-
-                let size_str = format!("{}x{}", w, h);
-                let sigma_str = format!("{}", sigma);
-
-                let regression_marker = if speedup < 0.95 { " *** REGRESSION" } else { "" };
-                println!(
-                    "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
-                    size_str, sigma_str, pat_name, "IIR", t_naive, t_opt, speedup, regression_marker
-                );
-
-                iir_results.push(BenchResult {
-                    image_size: size_str,
-                    sigma: sigma_str,
-                    input_pattern: pat_name.to_string(),
-                    algorithm: "IIR".to_string(),
-                    naive_us: t_naive,
-                    opt_us: t_opt,
-                    speedup,
-                });
-            }
-        }
-    }
-
-    // ----- Asymmetric Sigma Benchmark (Box Blur) -----
-    println!("\n--- Asymmetric Sigma Benchmark (Box Blur) ---");
-    println!(
-        "{:<12} {:<12} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(84));
 
     let asym_sizes: &[(u32, u32)] = &[(64, 64), (256, 256), (512, 512)];
     let asym_sigmas: &[(f64, f64)] = &[(5.0, 0.0), (0.0, 5.0), (3.0, 10.0)];
-
-    for &(w, h) in asym_sizes {
-        for &(sx, sy) in asym_sigmas {
-            for &(pat_name, pat_fn) in input_patterns {
-                let data_template = pat_fn(w, h);
-                let iters = choose_iters(w, h);
-
-                let t_naive = bench_one_fn(
-                    &data_template,
-                    w,
-                    h,
-                    sx,
-                    sy,
-                    &box_blur_naive::apply,
-                    iters,
-                );
-                let t_opt = bench_one_fn(
-                    &data_template,
-                    w,
-                    h,
-                    sx,
-                    sy,
-                    &box_blur_opt::apply,
-                    iters,
-                );
-                let speedup = t_naive / t_opt;
-
-                let size_str = format!("{}x{}", w, h);
-                let sigma_str = format!("({},{})", sx, sy);
-
-                let regression_marker = if speedup < 0.95 { " *** REGRESSION" } else { "" };
-                println!(
-                    "{:<12} {:<12} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
-                    size_str,
-                    sigma_str,
-                    pat_name,
-                    "box-asym",
-                    t_naive,
-                    t_opt,
-                    speedup,
-                    regression_marker
-                );
-
-                box_results.push(BenchResult {
-                    image_size: size_str,
-                    sigma: sigma_str,
-                    input_pattern: pat_name.to_string(),
-                    algorithm: "box-asym".to_string(),
-                    naive_us: t_naive,
-                    opt_us: t_opt,
-                    speedup,
-                });
-            }
-        }
-    }
-
-    // ----- Threshold Boundary Tests -----
-    println!("\n--- Threshold Boundary Tests (w or h < 16 vs >= 16) ---");
-    println!(
-        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(80));
 
     let threshold_sizes: &[(u32, u32)] = &[
         (15, 64),
@@ -1258,82 +1190,242 @@ fn main() {
     let threshold_sigmas_box: &[f64] = &[3.0, 10.0];
     let threshold_sigmas_iir: &[f64] = &[0.5, 1.5];
 
-    for &(w, h) in threshold_sizes {
-        // Box blur
-        for &sigma in threshold_sigmas_box {
-            let data_template = make_random_alpha(w, h);
-            let iters = choose_iters(w, h);
+    // -----------------------------------------------------------------
+    // Build all configurations upfront
+    // -----------------------------------------------------------------
+    let mut configs: Vec<Config> = Vec::new();
+    let mut order: usize = 0;
 
-            let t_naive = bench_one_fn(
-                &data_template,
-                w,
-                h,
-                sigma,
-                sigma,
-                &box_blur_naive::apply,
-                iters,
-            );
-            let t_opt = bench_one_fn(
-                &data_template,
-                w,
-                h,
-                sigma,
-                sigma,
-                &box_blur_opt::apply,
-                iters,
-            );
-            let speedup = t_naive / t_opt;
-
-            let size_str = format!("{}x{}", w, h);
-            let sigma_str = format!("{}", sigma);
-            let note = if w < 16 || h < 16 {
-                " (should use naive)"
-            } else {
-                " (should use opt)"
-            };
-            let regression_marker = if speedup < 0.95 { " *** REGRESSION" } else { "" };
-            println!(
-                "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}{}",
-                size_str, sigma_str, "random", "box", t_naive, t_opt, speedup, regression_marker, note
-            );
+    // Section 1: Box Blur Benchmark
+    for &(w, h) in image_sizes {
+        for &sigma in box_sigmas {
+            for &pat in input_patterns {
+                configs.push(Config {
+                    order,
+                    section: Section::BoxBlur,
+                    width: w,
+                    height: h,
+                    sigma_x: sigma,
+                    sigma_y: sigma,
+                    pattern: pat,
+                    algorithm: Algorithm::Box,
+                    algorithm_label: "box".to_string(),
+                });
+                order += 1;
+            }
         }
+    }
 
-        // IIR blur
+    // Section 2: IIR Blur Benchmark
+    for &(w, h) in image_sizes {
+        for &sigma in iir_sigmas {
+            for &pat in input_patterns {
+                configs.push(Config {
+                    order,
+                    section: Section::IirBlur,
+                    width: w,
+                    height: h,
+                    sigma_x: sigma,
+                    sigma_y: sigma,
+                    pattern: pat,
+                    algorithm: Algorithm::Iir,
+                    algorithm_label: "IIR".to_string(),
+                });
+                order += 1;
+            }
+        }
+    }
+
+    // Section 3: Asymmetric Sigma Benchmark (Box Blur)
+    for &(w, h) in asym_sizes {
+        for &(sx, sy) in asym_sigmas {
+            for &pat in input_patterns {
+                configs.push(Config {
+                    order,
+                    section: Section::AsymmetricSigma,
+                    width: w,
+                    height: h,
+                    sigma_x: sx,
+                    sigma_y: sy,
+                    pattern: pat,
+                    algorithm: Algorithm::Box,
+                    algorithm_label: "box-asym".to_string(),
+                });
+                order += 1;
+            }
+        }
+    }
+
+    // Section 4: Threshold Boundary Tests
+    for &(w, h) in threshold_sizes {
+        // Box blur threshold tests
+        for &sigma in threshold_sigmas_box {
+            configs.push(Config {
+                order,
+                section: Section::ThresholdBoundary,
+                width: w,
+                height: h,
+                sigma_x: sigma,
+                sigma_y: sigma,
+                pattern: InputPattern::Random,
+                algorithm: Algorithm::Box,
+                algorithm_label: "box".to_string(),
+            });
+            order += 1;
+        }
+        // IIR blur threshold tests
         for &sigma in threshold_sigmas_iir {
-            let data_template = make_random_alpha(w, h);
-            let iters = choose_iters(w, h);
+            configs.push(Config {
+                order,
+                section: Section::ThresholdBoundary,
+                width: w,
+                height: h,
+                sigma_x: sigma,
+                sigma_y: sigma,
+                pattern: InputPattern::Random,
+                algorithm: Algorithm::Iir,
+                algorithm_label: "IIR".to_string(),
+            });
+            order += 1;
+        }
+    }
 
-            let t_naive = bench_one_fn(
-                &data_template,
-                w,
-                h,
-                sigma,
-                sigma,
-                &iir_blur_naive::apply,
-                iters,
-            );
-            let t_opt = bench_one_fn(
-                &data_template,
-                w,
-                h,
-                sigma,
-                sigma,
-                &iir_blur_opt::apply,
-                iters,
-            );
-            let speedup = t_naive / t_opt;
+    let total = configs.len();
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
-            let size_str = format!("{}x{}", w, h);
-            let sigma_str = format!("{}", sigma);
+    println!(
+        "Running {} benchmark configurations across {} threads...\n",
+        total, num_threads
+    );
+
+    // -----------------------------------------------------------------
+    // Parallel execution using std::thread::scope
+    // -----------------------------------------------------------------
+    let progress = AtomicUsize::new(0);
+    let chunk_size = (total + num_threads - 1) / num_threads;
+    let config_chunks: Vec<&[Config]> = configs.chunks(chunk_size).collect();
+
+    let mut all_results: Vec<BenchResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = config_chunks
+            .into_iter()
+            .map(|chunk| {
+                let progress_ref = &progress;
+                s.spawn(move || {
+                    let mut results = Vec::with_capacity(chunk.len());
+                    for config in chunk {
+                        results.push(run_config(config, progress_ref, total));
+                    }
+                    results
+                })
+            })
+            .collect();
+
+        let mut merged = Vec::with_capacity(total);
+        for handle in handles {
+            merged.extend(handle.join().unwrap());
+        }
+        merged
+    });
+
+    // Clear progress line
+    eprintln!();
+
+    // Sort by original order to restore deterministic output
+    all_results.sort_by_key(|r| r.order);
+
+    // -----------------------------------------------------------------
+    // Display results by section (same formatting as before)
+    // -----------------------------------------------------------------
+
+    // Section 1: Box Blur Benchmark
+    println!("--- Box Blur Benchmark ---");
+    println!(
+        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
+        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
+    );
+    println!("{}", "-".repeat(80));
+
+    let mut box_results: Vec<&BenchResult> = Vec::new();
+    let mut iir_results: Vec<&BenchResult> = Vec::new();
+
+    for r in &all_results {
+        if r.section == Section::BoxBlur {
+            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
+            println!(
+                "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
+                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
+                r.speedup, regression_marker
+            );
+            box_results.push(r);
+        }
+    }
+
+    // Section 2: IIR Blur Benchmark
+    println!("\n--- IIR Blur Benchmark ---");
+    println!(
+        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
+        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
+    );
+    println!("{}", "-".repeat(80));
+
+    for r in &all_results {
+        if r.section == Section::IirBlur {
+            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
+            println!(
+                "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
+                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
+                r.speedup, regression_marker
+            );
+            iir_results.push(r);
+        }
+    }
+
+    // Section 3: Asymmetric Sigma Benchmark (Box Blur)
+    println!("\n--- Asymmetric Sigma Benchmark (Box Blur) ---");
+    println!(
+        "{:<12} {:<12} {:<10} {:<10} {:>12} {:>12} {:>10}",
+        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
+    );
+    println!("{}", "-".repeat(84));
+
+    for r in &all_results {
+        if r.section == Section::AsymmetricSigma {
+            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
+            println!(
+                "{:<12} {:<12} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
+                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
+                r.speedup, regression_marker
+            );
+            box_results.push(r);
+        }
+    }
+
+    // Section 4: Threshold Boundary Tests
+    println!("\n--- Threshold Boundary Tests (w or h < 16 vs >= 16) ---");
+    println!(
+        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
+        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
+    );
+    println!("{}", "-".repeat(80));
+
+    for r in &all_results {
+        if r.section == Section::ThresholdBoundary {
+            // Parse width and height from image_size to determine the note
+            let parts: Vec<&str> = r.image_size.split('x').collect();
+            let w: u32 = parts[0].parse().unwrap_or(0);
+            let h: u32 = parts[1].parse().unwrap_or(0);
             let note = if w < 16 || h < 16 {
                 " (should use naive)"
             } else {
                 " (should use opt)"
             };
-            let regression_marker = if speedup < 0.95 { " *** REGRESSION" } else { "" };
+            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
             println!(
                 "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}{}",
-                size_str, sigma_str, "random", "IIR", t_naive, t_opt, speedup, regression_marker, note
+                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
+                r.speedup, regression_marker, note
             );
         }
     }
@@ -1343,9 +1435,13 @@ fn main() {
     // =====================================================================
     println!("\n=== Regression Summary ===\n");
 
-    let all_results: Vec<&BenchResult> = box_results.iter().chain(iir_results.iter()).collect();
+    let summary_results: Vec<&BenchResult> = box_results
+        .iter()
+        .copied()
+        .chain(iir_results.iter().copied())
+        .collect();
 
-    let regressions: Vec<&&BenchResult> = all_results
+    let regressions: Vec<&&BenchResult> = summary_results
         .iter()
         .filter(|r| r.speedup < 0.95)
         .collect();
@@ -1365,14 +1461,15 @@ fn main() {
         for r in &regressions {
             println!(
                 "{:<12} {:<12} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x",
-                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us, r.speedup
+                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
+                r.speedup
             );
         }
     }
 
     // Print best and worst speedups
     println!("\n--- Top 10 Best Speedups ---");
-    let mut sorted_by_speedup: Vec<&BenchResult> = all_results.iter().copied().collect();
+    let mut sorted_by_speedup: Vec<&BenchResult> = summary_results.iter().copied().collect();
     sorted_by_speedup.sort_by(|a, b| b.speedup.partial_cmp(&a.speedup).unwrap());
     for r in sorted_by_speedup.iter().take(10) {
         println!(
