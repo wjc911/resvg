@@ -15,8 +15,8 @@ const OPTIMIZED_CROSSOVER: usize = 64;
 /// 64 pixels * 4 channels * 4 bytes = 1 KiB per buffer, well within L1.
 const BATCH: usize = 64;
 
-/// Original (naive) arithmetic implementation — preserved verbatim for correctness
-/// reference and for small images where setup overhead dominates.
+/// Original (naive) arithmetic implementation — kept as a correctness reference
+/// and used for small images where batch-processing overhead dominates.
 #[cold]
 #[inline(never)]
 fn arithmetic_naive(
