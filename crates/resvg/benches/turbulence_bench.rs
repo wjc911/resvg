@@ -1,49 +1,78 @@
 // Copyright 2020 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Benchmark for feTurbulence filter.
+//! Benchmark for feTurbulence filter with real-world usage patterns.
 //!
 //! Run with: cargo bench --bench turbulence_bench -p resvg
 
 use std::hint::black_box;
 use std::time::Instant;
 
-// Re-export the apply function via the public crate interface would require
-// exposing internals. Instead, we duplicate the minimal code needed to call
-// the turbulence filter directly. This benchmark file measures wall-clock
-// time using std::time::Instant (no external benchmark framework dependency).
+struct Scenario {
+    name: &'static str,
+    base_frequency: &'static str,
+    num_octaves: u32,
+    turbulence_type: &'static str,
+}
 
-// We call into resvg's turbulence filter indirectly by constructing the
-// necessary types. Since turbulence::apply is pub(crate), we use a small
-// SVG document and render it to measure performance.
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "Fine Noise",
+        base_frequency: "0.05",
+        num_octaves: 2,
+        turbulence_type: "turbulence",
+    },
+    Scenario {
+        name: "Cloud Texture",
+        base_frequency: "0.01",
+        num_octaves: 3,
+        turbulence_type: "fractalNoise",
+    },
+    Scenario {
+        name: "Paper Texture",
+        base_frequency: "0.04",
+        num_octaves: 5,
+        turbulence_type: "fractalNoise",
+    },
+    Scenario {
+        name: "Directional Grain",
+        base_frequency: "0.1 0.01",
+        num_octaves: 2,
+        turbulence_type: "fractalNoise",
+    },
+    Scenario {
+        name: "High Frequency",
+        base_frequency: "0.2",
+        num_octaves: 1,
+        turbulence_type: "turbulence",
+    },
+];
+
+const RESOLUTIONS: &[(u32, u32)] = &[
+    (200, 150),
+    (400, 300),
+    (600, 400),
+    (800, 600),
+    (1024, 768),
+];
 
 fn bench_turbulence(
     width: u32,
     height: u32,
-    num_octaves: u32,
-    stitch_tiles: bool,
-    fractal_noise: bool,
+    scenario: &Scenario,
     iterations: u32,
 ) -> std::time::Duration {
-    // Create an SVG with feTurbulence
-    let stitch_str = if stitch_tiles { "stitch" } else { "noStitch" };
-    let type_str = if fractal_noise {
-        "fractalNoise"
-    } else {
-        "turbulence"
-    };
-
     let svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}">
   <defs>
     <filter id="turb" x="0" y="0" width="100%" height="100%">
-      <feTurbulence baseFrequency="0.05" numOctaves="{}" seed="42"
-                    stitchTiles="{}" type="{}"/>
+      <feTurbulence baseFrequency="{}" numOctaves="{}" seed="42"
+                    stitchTiles="noStitch" type="{}"/>
     </filter>
   </defs>
   <rect width="100%" height="100%" filter="url(#turb)"/>
 </svg>"#,
-        width, height, num_octaves, stitch_str, type_str
+        width, height, scenario.base_frequency, scenario.num_octaves, scenario.turbulence_type
     );
 
     let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).unwrap();
@@ -64,52 +93,37 @@ fn bench_turbulence(
 }
 
 fn main() {
-    println!("feTurbulence Benchmark");
-    println!("======================\n");
-
-    let resolutions: &[(u32, u32)] = &[(64, 64), (256, 256), (1024, 1024), (4096, 4096)];
-    let octave_counts: &[u32] = &[1, 2, 4, 8];
+    println!("feTurbulence Benchmark — Real-World Usage Patterns");
+    println!("===================================================\n");
 
     // Print header
     println!(
-        "{:<12} {:<8} {:<8} {:<10} {:<12} {:<14}",
-        "Resolution", "Octaves", "Stitch", "Mode", "Time (ms)", "Mpx/s"
+        "{:<20} {:<12} {:<12} {:<14} {:<10}",
+        "Scenario", "Resolution", "Time (ms)", "Mpix/s", "Iters"
     );
-    println!("{}", "-".repeat(72));
+    println!("{}", "-".repeat(70));
 
-    for &(w, h) in resolutions {
-        let pixels = w as f64 * h as f64;
-        // Adjust iterations to keep total time reasonable
-        let base_iters = if pixels > 1_000_000.0 {
-            2
-        } else if pixels > 100_000.0 {
-            10
-        } else {
-            50
-        };
+    for scenario in SCENARIOS {
+        for &(w, h) in RESOLUTIONS {
+            let pixels = w as f64 * h as f64;
 
-        for &octaves in octave_counts {
-            for &stitch in &[false, true] {
-                for &fractal in &[false, true] {
-                    let iters = base_iters;
-                    let elapsed = bench_turbulence(w, h, octaves, stitch, fractal, iters);
-                    let ms_per_iter = elapsed.as_secs_f64() * 1000.0 / iters as f64;
-                    let mpx_per_sec = pixels / (ms_per_iter / 1000.0) / 1_000_000.0;
+            // Dynamic iteration count: target ~2 seconds per measurement
+            let probe_dur = bench_turbulence(w, h, scenario, 1);
+            let probe_ms = probe_dur.as_secs_f64() * 1000.0;
+            let iterations = ((2000.0 / probe_ms).ceil() as u32).max(2).min(500);
 
-                    let mode = if fractal { "fractal" } else { "turbulence" };
-                    let stitch_str = if stitch { "yes" } else { "no" };
+            let elapsed = bench_turbulence(w, h, scenario, iterations);
+            let ms_per_iter = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
+            let mpx_per_sec = pixels / (ms_per_iter / 1000.0) / 1_000_000.0;
 
-                    println!(
-                        "{:<12} {:<8} {:<8} {:<10} {:<12.3} {:<14.2}",
-                        format!("{}x{}", w, h),
-                        octaves,
-                        stitch_str,
-                        mode,
-                        ms_per_iter,
-                        mpx_per_sec
-                    );
-                }
-            }
+            println!(
+                "{:<20} {:<12} {:<12.3} {:<14.2} {:<10}",
+                scenario.name,
+                format!("{}x{}", w, h),
+                ms_per_iter,
+                mpx_per_sec,
+                iterations
+            );
         }
         println!();
     }
