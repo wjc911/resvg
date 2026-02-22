@@ -57,9 +57,8 @@ impl InputPattern {
             InputPattern::Noisy => {
                 // Checkerboard-like pattern with varying alpha using nested rects
                 // This creates surface variation through multiple overlapping elements.
-                let mut elements = format!(
-                    r#"<rect width="{w}" height="{h}" fill="gray" fill-opacity="0.3"/>"#
-                );
+                let mut elements =
+                    format!(r#"<rect width="{w}" height="{h}" fill="gray" fill-opacity="0.3"/>"#);
                 // Add some smaller rects at various positions to create alpha variation
                 let step = (w.max(h) / 8).max(1);
                 for i in 0..8 {
@@ -216,7 +215,10 @@ fn run_benchmarks_parallel(configs: Vec<BenchConfig>) -> Vec<BenchResult> {
         .unwrap_or(1);
 
     let total = configs.len();
-    eprintln!("  Using {} threads for {} configurations", num_threads, total);
+    eprintln!(
+        "  Using {} threads for {} configurations",
+        num_threads, total
+    );
 
     // Wrap each config with its original index.
     let indexed: Vec<IndexedConfig> = configs
@@ -280,8 +282,8 @@ fn diffuse_configs() -> Vec<BenchConfig> {
         (16, 16),
         (32, 32),
         (64, 64),
-        (127, 127),  // Just below threshold (128*128 = 16384, 127*127 = 16129)
-        (128, 128),  // At threshold
+        (127, 127), // Just below threshold (128*128 = 16384, 127*127 = 16129)
+        (128, 128), // At threshold
         (256, 256),
         (512, 512),
         (1024, 1024),
@@ -311,7 +313,11 @@ fn diffuse_configs() -> Vec<BenchConfig> {
         (2.0, 10.0, "dc=2,ss=10".to_string()),
     ];
 
-    let patterns = vec![InputPattern::Flat, InputPattern::Gradient, InputPattern::Noisy];
+    let patterns = vec![
+        InputPattern::Flat,
+        InputPattern::Gradient,
+        InputPattern::Noisy,
+    ];
 
     let mut configs = Vec::new();
 
@@ -326,9 +332,7 @@ fn diffuse_configs() -> Vec<BenchConfig> {
                         light_name,
                         light_xml: light_xml.clone(),
                         params_desc: desc.clone(),
-                        filter_attrs: format!(
-                            r#"surfaceScale="{ss}" diffuseConstant="{dc}""#
-                        ),
+                        filter_attrs: format!(r#"surfaceScale="{ss}" diffuseConstant="{dc}""#),
                         pattern,
                     });
                 }
@@ -377,7 +381,11 @@ fn specular_configs() -> Vec<BenchConfig> {
         (128.0, 1.0, 5.0, "se=128,sc=1,ss=5".to_string()),
     ];
 
-    let patterns = vec![InputPattern::Flat, InputPattern::Gradient, InputPattern::Noisy];
+    let patterns = vec![
+        InputPattern::Flat,
+        InputPattern::Gradient,
+        InputPattern::Noisy,
+    ];
 
     let mut configs = Vec::new();
 
@@ -434,7 +442,10 @@ fn print_results_table(filter_name: &str, results: &[BenchResult]) {
 /// Print a summary table grouped by size and light type, averaging across params/patterns.
 fn print_summary_table(filter_name: &str, results: &[BenchResult]) {
     println!("\n{}", "=".repeat(90));
-    println!("  {} Summary (averaged across params and input patterns)", filter_name);
+    println!(
+        "  {} Summary (averaged across params and input patterns)",
+        filter_name
+    );
     println!("{}", "=".repeat(90));
     println!(
         "{:<12} {:<10} {:>15} {:>15} {:>12} {:>8}",
@@ -531,7 +542,11 @@ fn run_threshold_test() {
     let results = run_benchmarks_parallel(configs);
 
     for (result, &(w, h, category)) in results.iter().zip(threshold_sizes.iter()) {
-        let path = if (w * h) < 128 * 128 { "NAIVE" } else { "OPTIMIZED" };
+        let path = if (w * h) < 128 * 128 {
+            "NAIVE"
+        } else {
+            "OPTIMIZED"
+        };
 
         println!(
             "{:<24} {:<18} {:>12.1} {:>12.2} {:>10}",
@@ -544,7 +559,10 @@ fn run_threshold_test() {
 /// Check for potential regressions: flag any case where small images are anomalously slow.
 fn check_regressions(results: &[BenchResult], filter_name: &str) {
     println!("\n{}", "=".repeat(80));
-    println!("  {} Regression Check (>5% slower than expected)", filter_name);
+    println!(
+        "  {} Regression Check (>5% slower than expected)",
+        filter_name
+    );
     println!("{}", "=".repeat(80));
 
     // Group results by (light, params, pattern) and check that larger images
@@ -588,9 +606,13 @@ fn check_regressions(results: &[BenchResult], filter_name: &str) {
                     println!(
                         "  WARNING: {} -- {}x{} ({:.2} Mpix/s) is {:.1}% slower than {}x{} ({:.2} Mpix/s)",
                         key,
-                        cw, ch, cur_mpix,
+                        cw,
+                        ch,
+                        cur_mpix,
                         (1.0 - ratio) * 100.0,
-                        pw, ph, prev_mpix,
+                        pw,
+                        ph,
+                        prev_mpix,
                     );
                     regressions_found = true;
                 }
