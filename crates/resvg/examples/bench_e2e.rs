@@ -5,14 +5,16 @@
 //!
 //! Renders programmatically-generated SVGs (realistic filter scenarios) and
 //! existing filter test SVGs at multiple resolutions, measuring wall-clock time.
-//! Uses up to 4 threads for parallel benchmarking.
+//! Supports sequential (--threads 1) or parallel (--threads N) execution.
 //!
 //! **Modes:**
 //! - Default: run benchmark, output TSV to stdout
 //! - `--compare <baseline.tsv>`: run benchmark and compare against a baseline file
+//! - `--output-tsv <file>`: save TSV output to file instead of stdout
+//! - `--threads N`: use N threads (default: 1 for sequential, noise-free measurement)
 //!
 //! Usage:
-//!   cargo run --release --example bench_e2e > results.tsv
+//!   cargo run --release --example bench_e2e -- --output-tsv /tmp/baseline.tsv
 //!   cargo run --release --example bench_e2e -- --compare /tmp/baseline.tsv
 
 use std::collections::{HashMap, HashSet};
@@ -24,10 +26,6 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 // Configuration (defaults, overridable via CLI)
 // ---------------------------------------------------------------------------
-
-const NUM_THREADS: usize = 4;
-const DEFAULT_WARMUP_ITERS: usize = 2;
-const DEFAULT_BENCH_ITERS: usize = 5;
 
 /// Representative resolutions (width, height).
 const RESOLUTIONS: &[(u32, u32)] = &[
@@ -43,6 +41,18 @@ const RESOLUTIONS: &[(u32, u32)] = &[
     (1024, 768),
     (1500, 1000),
 ];
+
+/// Resolution-scaled iteration count. Larger images require fewer iterations
+/// to amortise warmup cost while still suppressing sub-percent noise.
+fn iters_for_resolution(w: u32, h: u32) -> usize {
+    let max_dim = w.max(h);
+    match max_dim {
+        0..=49 => 2000,
+        50..=99 => 1000,
+        100..=499 => 300,
+        _ => 100,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -583,11 +593,16 @@ fn collect_existing_filter_svgs() -> Vec<TestCase> {
     cases
 }
 
+// Maximum wall time budget per case (milliseconds). Cases that are intrinsically
+// slower than this per-iteration (e.g. huge-radius morphology) are auto-scaled.
+const MAX_CASE_BUDGET_MS: f64 = 30_000.0; // 30 seconds total per case
+const SKIP_ITER_THRESHOLD_MS: f64 = 10_000.0; // if 1 iter > 10s, skip case
+
 // ---------------------------------------------------------------------------
 // Benchmark execution
 // ---------------------------------------------------------------------------
 
-fn bench_one(case: &TestCase, warmup_iters: usize, bench_iters: usize) -> f64 {
+fn bench_one(case: &TestCase) -> f64 {
     let opt = usvg::Options::default();
     let tree = match usvg::Tree::from_str(&case.svg, &opt) {
         Ok(t) => t,
@@ -613,8 +628,33 @@ fn bench_one(case: &TestCase, warmup_iters: usize, bench_iters: usize) -> f64 {
         }
     };
 
-    // Warmup
-    for _ in 0..warmup_iters {
+    // Probe: run one iteration to estimate per-iter cost and scale accordingly.
+    pixmap.fill(tiny_skia::Color::TRANSPARENT);
+    let probe_start = Instant::now();
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let probe_ms = probe_start.elapsed().as_secs_f64() * 1000.0;
+
+    if probe_ms >= SKIP_ITER_THRESHOLD_MS {
+        // Degenerate case (e.g. huge-radius morphology): skip with probe as result.
+        eprintln!(
+            " [slow:{:.0}ms, skipping extra iters]",
+            probe_ms
+        );
+        return probe_ms;
+    }
+
+    // Scale iteration count to stay within budget, but respect resolution-based minimum.
+    let resolution_iters = iters_for_resolution(case.width, case.height);
+    let budget_iters = if probe_ms > 0.0 {
+        (MAX_CASE_BUDGET_MS / probe_ms) as usize
+    } else {
+        resolution_iters
+    };
+    let bench_iters = resolution_iters.min(budget_iters).max(5);
+    let warmup_iters = (bench_iters / 10).max(2);
+
+    // Warmup (probe already counted as 1)
+    for _ in 1..warmup_iters {
         pixmap.fill(tiny_skia::Color::TRANSPARENT);
         resvg::render(&tree, transform, &mut pixmap.as_mut());
     }
@@ -632,11 +672,7 @@ fn bench_one(case: &TestCase, warmup_iters: usize, bench_iters: usize) -> f64 {
     times[times.len() / 2] // median
 }
 
-fn parallel_bench(
-    cases: Vec<TestCase>,
-    warmup_iters: usize,
-    bench_iters: usize,
-) -> Vec<BenchResult> {
+fn run_bench(cases: Vec<TestCase>, num_threads: usize) -> Vec<BenchResult> {
     let total = cases.len();
     let counter = AtomicUsize::new(0);
     let cases_ref = &cases;
@@ -644,9 +680,10 @@ fn parallel_bench(
 
     // Pre-compute the work assignments for each thread
     let chunks: Vec<Vec<usize>> = {
-        let mut chunks = vec![Vec::new(); NUM_THREADS];
+        let n = num_threads.max(1);
+        let mut chunks = vec![Vec::new(); n];
         for (i, _) in cases.iter().enumerate() {
-            chunks[i % NUM_THREADS].push(i);
+            chunks[i % n].push(i);
         }
         chunks
     };
@@ -659,7 +696,7 @@ fn parallel_bench(
                     let mut results = Vec::new();
                     for idx in indices {
                         let case = &cases_ref[idx];
-                        let median = bench_one(case, warmup_iters, bench_iters);
+                        let median = bench_one(case);
                         let done = counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
                         eprint!("\r[{}/{}] {}", done, total, case.name);
                         results.push((
@@ -691,10 +728,10 @@ fn parallel_bench(
 // Output & comparison
 // ---------------------------------------------------------------------------
 
-fn output_tsv(results: &[BenchResult]) {
-    println!("name\tresolution\tmedian_ms");
+fn write_tsv(results: &[BenchResult], writer: &mut dyn std::io::Write) {
+    writeln!(writer, "name\tresolution\tmedian_ms").unwrap();
     for r in results {
-        println!("{}\t{}\t{:.3}", r.name, r.resolution, r.median_ms);
+        writeln!(writer, "{}\t{}\t{:.3}", r.name, r.resolution, r.median_ms).unwrap();
     }
 }
 
@@ -899,8 +936,8 @@ fn main() {
     // Parse CLI arguments
     let mut compare_path: Option<PathBuf> = None;
     let mut only_path: Option<PathBuf> = None;
-    let mut bench_iters = DEFAULT_BENCH_ITERS;
-    let mut warmup_iters = DEFAULT_WARMUP_ITERS;
+    let mut output_tsv_path: Option<PathBuf> = None;
+    let mut num_threads: usize = 1;
 
     let mut i = 1;
     while i < args.len() {
@@ -913,18 +950,19 @@ fn main() {
                 only_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--iters" => {
-                bench_iters = args[i + 1].parse().expect("Invalid --iters value");
+            "--output-tsv" => {
+                output_tsv_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--warmup" => {
-                warmup_iters = args[i + 1].parse().expect("Invalid --warmup value");
+            "--threads" => {
+                num_threads = args[i + 1].parse().expect("Invalid --threads value");
                 i += 2;
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
-                    "Usage: bench_e2e [--compare <baseline.tsv>] [--only <cases.tsv>] [--iters N] [--warmup N]"
+                    "Usage: bench_e2e [--compare <baseline.tsv>] [--output-tsv <file>] \
+                     [--only <cases.tsv>] [--threads N]"
                 );
                 std::process::exit(1);
             }
@@ -959,18 +997,22 @@ fn main() {
     }
 
     eprintln!(
-        "Total: {} test cases, {} threads, {} warmup + {} measured iterations",
+        "Total: {} test cases, {} thread(s), resolution-scaled iterations",
         all_cases.len(),
-        NUM_THREADS,
-        warmup_iters,
-        bench_iters,
+        num_threads,
     );
     eprintln!("Running benchmarks...");
 
-    let results = parallel_bench(all_cases, warmup_iters, bench_iters);
+    let results = run_bench(all_cases, num_threads);
 
-    // Always output TSV to stdout
-    output_tsv(&results);
+    // Output TSV to file or stdout
+    if let Some(ref path) = output_tsv_path {
+        let mut file = std::fs::File::create(path).expect("Failed to create output TSV file");
+        write_tsv(&results, &mut file);
+        eprintln!("TSV results written to {}", path.display());
+    } else {
+        write_tsv(&results, &mut std::io::stdout());
+    }
 
     // If comparing, load baseline and print comparison to stderr
     if let Some(path) = compare_path {
