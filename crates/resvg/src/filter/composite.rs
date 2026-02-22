@@ -114,8 +114,7 @@ fn arithmetic_optimized(
         // source alphas equal to zero, the output alpha is guaranteed zero.
         // This avoids the costly SoA conversion on transparent regions.
         if can_skip_transparent {
-            let all_transparent =
-                s1.iter().all(|p| p.a == 0) && s2.iter().all(|p| p.a == 0);
+            let all_transparent = s1.iter().all(|p| p.a == 0) && s2.iter().all(|p| p.a == 0);
             if all_transparent {
                 offset += batch_len;
                 continue;

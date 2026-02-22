@@ -34,7 +34,15 @@ fn approx_zero(v: f32) -> bool {
 // Naive implementation (verbatim from composite.rs)
 // ---------------------------------------------------------------------------
 
-fn arithmetic_naive(k1: f32, k2: f32, k3: f32, k4: f32, src1: &[RGBA8], src2: &[RGBA8], dest: &mut [RGBA8]) {
+fn arithmetic_naive(
+    k1: f32,
+    k2: f32,
+    k3: f32,
+    k4: f32,
+    src1: &[RGBA8],
+    src2: &[RGBA8],
+    dest: &mut [RGBA8],
+) {
     let calc = |i1: u8, i2: u8, max: f32| -> f32 {
         let i1 = i1 as f32 / 255.0;
         let i2 = i2 as f32 / 255.0;
@@ -71,7 +79,15 @@ fn clamp_and_scale(val: f32, max: f32) -> u8 {
     (val.clamp(0.0, max) * 255.0) as u8
 }
 
-fn arithmetic_optimized(k1: f32, k2: f32, k3: f32, k4: f32, src1: &[RGBA8], src2: &[RGBA8], dest: &mut [RGBA8]) {
+fn arithmetic_optimized(
+    k1: f32,
+    k2: f32,
+    k3: f32,
+    k4: f32,
+    src1: &[RGBA8],
+    src2: &[RGBA8],
+    dest: &mut [RGBA8],
+) {
     let len = src1.len();
     let mut offset = 0;
     const INV_255: f32 = 1.0 / 255.0;
@@ -99,8 +115,7 @@ fn arithmetic_optimized(k1: f32, k2: f32, k3: f32, k4: f32, src1: &[RGBA8], src2
         let s2 = &src2[offset..offset + batch_len];
 
         if can_skip_transparent {
-            let all_transparent =
-                s1.iter().all(|p| p.a == 0) && s2.iter().all(|p| p.a == 0);
+            let all_transparent = s1.iter().all(|p| p.a == 0) && s2.iter().all(|p| p.a == 0);
             if all_transparent {
                 offset += batch_len;
                 continue;
@@ -167,7 +182,15 @@ fn arithmetic_optimized(k1: f32, k2: f32, k3: f32, k4: f32, src1: &[RGBA8], src2
 
 const OPTIMIZED_CROSSOVER: usize = 64;
 
-fn arithmetic_production(k1: f32, k2: f32, k3: f32, k4: f32, src1: &[RGBA8], src2: &[RGBA8], dest: &mut [RGBA8]) {
+fn arithmetic_production(
+    k1: f32,
+    k2: f32,
+    k3: f32,
+    k4: f32,
+    src1: &[RGBA8],
+    src2: &[RGBA8],
+    dest: &mut [RGBA8],
+) {
     if k1 == 0.0 && k2 == 0.0 && k3 == 0.0 && k4 == 0.0 {
         return;
     }
@@ -185,10 +208,20 @@ fn arithmetic_production(k1: f32, k2: f32, k3: f32, k4: f32, src1: &[RGBA8], src
 // ---------------------------------------------------------------------------
 
 fn generate_pixels(count: usize, pattern: &str, seed: u64) -> Vec<RGBA8> {
-    let mut pixels = vec![RGBA8 { r: 0, g: 0, b: 0, a: 0 }; count];
+    let mut pixels = vec![
+        RGBA8 {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0
+        };
+        count
+    ];
     let mut rng = seed;
     let mut next = || -> u64 {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rng
     };
 
@@ -281,23 +314,71 @@ fn run_config(config: &Config, order: usize, progress: &AtomicUsize, total: usiz
 
     let src1_n = src1.clone();
     let src2_n = src2.clone();
-    let mut dest_n = vec![RGBA8 { r: 0, g: 0, b: 0, a: 0 }; pixel_count];
-    let naive_dur = bench_fn(|| {
-        for d in dest_n.iter_mut() {
-            *d = RGBA8 { r: 0, g: 0, b: 0, a: 0 };
-        }
-        arithmetic_naive(config.k1, config.k2, config.k3, config.k4, &src1_n, &src2_n, &mut dest_n);
-    }, pixel_count);
+    let mut dest_n = vec![
+        RGBA8 {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0
+        };
+        pixel_count
+    ];
+    let naive_dur = bench_fn(
+        || {
+            for d in dest_n.iter_mut() {
+                *d = RGBA8 {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                };
+            }
+            arithmetic_naive(
+                config.k1,
+                config.k2,
+                config.k3,
+                config.k4,
+                &src1_n,
+                &src2_n,
+                &mut dest_n,
+            );
+        },
+        pixel_count,
+    );
 
     let src1_p = src1.clone();
     let src2_p = src2.clone();
-    let mut dest_p = vec![RGBA8 { r: 0, g: 0, b: 0, a: 0 }; pixel_count];
-    let prod_dur = bench_fn(|| {
-        for d in dest_p.iter_mut() {
-            *d = RGBA8 { r: 0, g: 0, b: 0, a: 0 };
-        }
-        arithmetic_production(config.k1, config.k2, config.k3, config.k4, &src1_p, &src2_p, &mut dest_p);
-    }, pixel_count);
+    let mut dest_p = vec![
+        RGBA8 {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0
+        };
+        pixel_count
+    ];
+    let prod_dur = bench_fn(
+        || {
+            for d in dest_p.iter_mut() {
+                *d = RGBA8 {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                };
+            }
+            arithmetic_production(
+                config.k1,
+                config.k2,
+                config.k3,
+                config.k4,
+                &src1_p,
+                &src2_p,
+                &mut dest_p,
+            );
+        },
+        pixel_count,
+    );
 
     let naive_ns = naive_dur.as_nanos();
     let prod_ns = prod_dur.as_nanos();
@@ -399,7 +480,8 @@ fn main() {
     let patterns: [&'static str; 2] = ["opaque", "photo"];
 
     // Build all configurations upfront
-    let mut configs: Vec<Config> = Vec::with_capacity(sizes.len() * k_values.len() * patterns.len());
+    let mut configs: Vec<Config> =
+        Vec::with_capacity(sizes.len() * k_values.len() * patterns.len());
     for &(size_label, w, h) in &sizes {
         for &(k_label, k1, k2, k3, k4) in &k_values {
             for &pattern in &patterns {
@@ -424,7 +506,10 @@ fn main() {
         .unwrap_or(1);
 
     eprintln!("=== Part 1: Arithmetic Mode (naive vs production) ===");
-    eprintln!("Running {} configurations on {} threads...\n", total, num_threads);
+    eprintln!(
+        "Running {} configurations on {} threads...\n",
+        total, num_threads
+    );
 
     let progress = AtomicUsize::new(0);
 
@@ -502,7 +587,10 @@ fn main() {
 
     println!("\n=== Arithmetic Summary ===");
     println!("Total configurations tested: {}", results.len());
-    println!("Regressions (prod >5% slower than naive): {}", regression_count);
+    println!(
+        "Regressions (prod >5% slower than naive): {}",
+        regression_count
+    );
 
     println!("\n=== Average Speedup by Image Size ===");
     for &(size_label, _, _) in &sizes {
@@ -510,9 +598,16 @@ fn main() {
         if matching.is_empty() {
             continue;
         }
-        let avg_speedup: f64 = matching.iter().map(|r| r.speedup).sum::<f64>() / matching.len() as f64;
-        let min_speedup: f64 = matching.iter().map(|r| r.speedup).fold(f64::INFINITY, f64::min);
-        let max_speedup: f64 = matching.iter().map(|r| r.speedup).fold(f64::NEG_INFINITY, f64::max);
+        let avg_speedup: f64 =
+            matching.iter().map(|r| r.speedup).sum::<f64>() / matching.len() as f64;
+        let min_speedup: f64 = matching
+            .iter()
+            .map(|r| r.speedup)
+            .fold(f64::INFINITY, f64::min);
+        let max_speedup: f64 = matching
+            .iter()
+            .map(|r| r.speedup)
+            .fold(f64::NEG_INFINITY, f64::max);
         println!(
             "  {:<12}  avg={:.2}x  min={:.2}x  max={:.2}x",
             size_label, avg_speedup, min_speedup, max_speedup
@@ -525,12 +620,7 @@ fn main() {
     println!("\n\n--- Part 2: Non-Arithmetic Operators (SVG rendering) ---\n");
 
     let operators = ["over", "in", "out"];
-    let svg_sizes: &[(u32, u32)] = &[
-        (48, 48),
-        (96, 96),
-        (200, 150),
-        (400, 300),
-    ];
+    let svg_sizes: &[(u32, u32)] = &[(48, 48), (96, 96), (200, 150), (400, 300)];
 
     println!(
         "{:<10} {:<12} {:<12} {:<14}",
