@@ -50,3 +50,7 @@ raster-images = ["gif", "image-webp", "dep:zune-jpeg"]
 [[bench]]
 name = "turbulence_bench"
 harness = false
+
+[[bench]]
+name = "composite_arithmetic"
+harness = false
