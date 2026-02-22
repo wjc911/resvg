@@ -256,7 +256,6 @@ fn specular_lighting_naive(
 /// Note: this is *not* a SIMD or data-layout optimisation. The pixel data is
 /// still in AoS `RGBA8` order and the per-pixel branching prevents
 /// auto-vectorisation.
-#[inline(never)]
 fn specular_lighting_optimized(
     fe: &SpecularLighting,
     light_source: LightSource,
@@ -276,21 +275,7 @@ fn specular_lighting_optimized(
     let exp_is_one = specular_exponent.approx_eq_ulps(&1.0, 4);
     let scale_factor = surface_scale / 255.0;
 
-    // `feDistantLight` has a fixed vector, so calculate it beforehand.
-    let mut light_vector = match light_source {
-        LightSource::DistantLight(light) => {
-            let azimuth = light.azimuth.to_radians();
-            let elevation = light.elevation.to_radians();
-            Vector3::new(
-                azimuth.cos() * elevation.cos(),
-                azimuth.sin() * elevation.cos(),
-                elevation.sin(),
-            )
-        }
-        _ => Vector3::new(1.0, 1.0, 1.0),
-    };
-
-    #[inline]
+    #[inline(always)]
     fn specular_factor(
         normal: Normal,
         light_vector: Vector3,
@@ -331,27 +316,21 @@ fn specular_lighting_optimized(
         specular_constant * k
     }
 
-    let mut calc = |nx, ny, normal: Normal| {
-        match light_source {
-            LightSource::DistantLight(_) => {}
-            // Note: PointLight and SpotLight arms are identical but cannot be
-            // merged with an or-pattern because `PointLight` and `SpotLight`
-            // are distinct types — Rust requires a single binding type per arm.
-            LightSource::PointLight(ref light) => {
-                let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
-                let origin = Vector3::new(light.x, light.y, light.z);
-                let v = origin - Vector3::new(nx as f32, ny as f32, nz);
-                light_vector = v.normalized().unwrap_or(v);
-            }
-            LightSource::SpotLight(ref light) => {
-                let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
-                let origin = Vector3::new(light.x, light.y, light.z);
-                let v = origin - Vector3::new(nx as f32, ny as f32, nz);
-                light_vector = v.normalized().unwrap_or(v);
-            }
-        }
-
-        let light_color = light_color(&light_source, lighting_color, light_vector);
+    #[inline(always)]
+    fn write_pixel(
+        dest: &mut ImageRefMut,
+        nx: u32,
+        ny: u32,
+        light_vector: Vector3,
+        light_source: &LightSource,
+        lighting_color: Color,
+        normal: Normal,
+        specular_exponent: f32,
+        specular_constant: f32,
+        exp_is_one: bool,
+        scale_factor: f32,
+    ) {
+        let light_color = light_color(light_source, lighting_color, light_vector);
         let factor = specular_factor(
             normal,
             light_vector,
@@ -369,26 +348,128 @@ fn specular_lighting_optimized(
         let a = calc_specular_alpha(r, g, b);
 
         *dest.pixel_at_mut(nx, ny) = RGBA8 { b, g, r, a };
-    };
-
-    calc(0, 0, top_left_normal(src));
-    calc(width - 1, 0, top_right_normal(src));
-    calc(0, height - 1, bottom_left_normal(src));
-    calc(width - 1, height - 1, bottom_right_normal(src));
-
-    for x in 1..width - 1 {
-        calc(x, 0, top_row_normal(src, x));
-        calc(x, height - 1, bottom_row_normal(src, x));
     }
 
-    for y in 1..height - 1 {
-        calc(0, y, left_column_normal(src, y));
-        calc(width - 1, y, right_column_normal(src, y));
+    // Helper to compute the light vector for point/spot lights (identical logic).
+    #[inline(always)]
+    fn point_light_vector(src: ImageRef, nx: u32, ny: u32, lx: f32, ly: f32, lz: f32, surface_scale: f32) -> Vector3 {
+        let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
+        let origin = Vector3::new(lx, ly, lz);
+        let v = origin - Vector3::new(nx as f32, ny as f32, nz);
+        v.normalized().unwrap_or(v)
     }
 
-    for y in 1..height - 1 {
-        for x in 1..width - 1 {
-            calc(x, y, interior_normal(src, x, y));
+    // Hoist the light-type match OUTSIDE the pixel loop so that each branch
+    // gets its own monomorphized inner loop.  This eliminates the per-pixel
+    // branch and lets LLVM reason about (and vectorise) each loop body
+    // independently.
+    match light_source {
+        LightSource::DistantLight(ref dl) => {
+            let azimuth = dl.azimuth.to_radians();
+            let elevation = dl.elevation.to_radians();
+            let light_vector = Vector3::new(
+                azimuth.cos() * elevation.cos(),
+                azimuth.sin() * elevation.cos(),
+                elevation.sin(),
+            );
+            let ls_ref = &light_source;
+
+            macro_rules! calc_distant {
+                ($nx:expr, $ny:expr, $normal:expr) => {
+                    write_pixel(
+                        &mut dest, $nx, $ny,
+                        light_vector, ls_ref, lighting_color, $normal,
+                        specular_exponent, specular_constant, exp_is_one, scale_factor,
+                    )
+                };
+            }
+
+            calc_distant!(0, 0, top_left_normal(src));
+            calc_distant!(width - 1, 0, top_right_normal(src));
+            calc_distant!(0, height - 1, bottom_left_normal(src));
+            calc_distant!(width - 1, height - 1, bottom_right_normal(src));
+
+            for x in 1..width - 1 {
+                calc_distant!(x, 0, top_row_normal(src, x));
+                calc_distant!(x, height - 1, bottom_row_normal(src, x));
+            }
+            for y in 1..height - 1 {
+                calc_distant!(0, y, left_column_normal(src, y));
+                calc_distant!(width - 1, y, right_column_normal(src, y));
+            }
+            for y in 1..height - 1 {
+                for x in 1..width - 1 {
+                    calc_distant!(x, y, interior_normal(src, x, y));
+                }
+            }
+        }
+        LightSource::PointLight(ref pl) => {
+            let (lx, ly, lz) = (pl.x, pl.y, pl.z);
+            let ls_ref = &light_source;
+
+            macro_rules! calc_point {
+                ($nx:expr, $ny:expr, $normal:expr) => {{
+                    let lv = point_light_vector(src, $nx, $ny, lx, ly, lz, surface_scale);
+                    write_pixel(
+                        &mut dest, $nx, $ny,
+                        lv, ls_ref, lighting_color, $normal,
+                        specular_exponent, specular_constant, exp_is_one, scale_factor,
+                    )
+                }};
+            }
+
+            calc_point!(0, 0, top_left_normal(src));
+            calc_point!(width - 1, 0, top_right_normal(src));
+            calc_point!(0, height - 1, bottom_left_normal(src));
+            calc_point!(width - 1, height - 1, bottom_right_normal(src));
+
+            for x in 1..width - 1 {
+                calc_point!(x, 0, top_row_normal(src, x));
+                calc_point!(x, height - 1, bottom_row_normal(src, x));
+            }
+            for y in 1..height - 1 {
+                calc_point!(0, y, left_column_normal(src, y));
+                calc_point!(width - 1, y, right_column_normal(src, y));
+            }
+            for y in 1..height - 1 {
+                for x in 1..width - 1 {
+                    calc_point!(x, y, interior_normal(src, x, y));
+                }
+            }
+        }
+        LightSource::SpotLight(ref sl) => {
+            let (lx, ly, lz) = (sl.x, sl.y, sl.z);
+            let ls_ref = &light_source;
+
+            macro_rules! calc_spot {
+                ($nx:expr, $ny:expr, $normal:expr) => {{
+                    let lv = point_light_vector(src, $nx, $ny, lx, ly, lz, surface_scale);
+                    write_pixel(
+                        &mut dest, $nx, $ny,
+                        lv, ls_ref, lighting_color, $normal,
+                        specular_exponent, specular_constant, exp_is_one, scale_factor,
+                    )
+                }};
+            }
+
+            calc_spot!(0, 0, top_left_normal(src));
+            calc_spot!(width - 1, 0, top_right_normal(src));
+            calc_spot!(0, height - 1, bottom_left_normal(src));
+            calc_spot!(width - 1, height - 1, bottom_right_normal(src));
+
+            for x in 1..width - 1 {
+                calc_spot!(x, 0, top_row_normal(src, x));
+                calc_spot!(x, height - 1, bottom_row_normal(src, x));
+            }
+            for y in 1..height - 1 {
+                calc_spot!(0, y, left_column_normal(src, y));
+                calc_spot!(width - 1, y, right_column_normal(src, y));
+            }
+            for y in 1..height - 1 {
+                for x in 1..width - 1 {
+                    calc_spot!(x, y, interior_normal(src, x, y));
+                }
+            }
         }
     }
 }
