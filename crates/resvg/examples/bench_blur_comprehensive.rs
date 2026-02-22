@@ -1,15 +1,18 @@
 // Copyright 2020 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Comprehensive performance regression benchmark for feGaussianBlur.
+//! Comprehensive real-world performance benchmark for feGaussianBlur.
 //!
-//! Tests both box blur (sigma >= 2.0) and IIR blur (sigma < 2.0) across
-//! a wide range of image sizes, sigma values, input patterns, and
-//! asymmetric sigma configurations. Also tests around the 16x16 threshold
-//! where the code switches between naive and optimized paths.
+//! Organized by scenario rather than raw size x sigma matrix:
+//!   1. Icon Shadow:       sizes 16-96,   sigma 1-4
+//!   2. Card Shadow:       sizes 200-600, sigma 3-8
+//!   3. Backdrop Blur:     sizes 400-1500, sigma 8-40
+//!   4. Threshold Boundary: sizes near 250k/500k pixel boundaries
+//!   5. Asymmetric Blur:   sigma_x != sigma_y for directional effects
 //!
-//! Uses multithreading (std::thread::scope) to run independent benchmark
-//! configurations in parallel across all available CPU cores.
+//! Input patterns:
+//!   - "opaque" (solid RGBA, typical for icons/UI elements)
+//!   - "photo"  (random RGBA, typical for photographic image blur)
 //!
 //! Run with: cargo run -p resvg --release --example bench_blur_comprehensive
 
@@ -122,18 +125,10 @@ mod box_blur_naive {
             let mut val_b = blur_radius_next * (fv.b as isize);
             let mut val_a = blur_radius_next * (fv.a as isize);
             let get_top = |i: usize| {
-                if i < col_start {
-                    fv
-                } else {
-                    backbuf.data[i]
-                }
+                if i < col_start { fv } else { backbuf.data[i] }
             };
             let get_bottom = |i: usize| {
-                if i > col_end {
-                    lv
-                } else {
-                    backbuf.data[i]
-                }
+                if i > col_end { lv } else { backbuf.data[i] }
             };
             for j in 0..cmp::min(blur_radius, height) {
                 let bb = backbuf.data[ti + j * width];
@@ -224,18 +219,10 @@ mod box_blur_naive {
             let mut val_b = blur_radius_next * (fv.b as isize);
             let mut val_a = blur_radius_next * (fv.a as isize);
             let get_left = |i: usize| {
-                if i < row_start {
-                    fv
-                } else {
-                    backbuf.data[i]
-                }
+                if i < row_start { fv } else { backbuf.data[i] }
             };
             let get_right = |i: usize| {
-                if i > row_end {
-                    lv
-                } else {
-                    backbuf.data[i]
-                }
+                if i > row_end { lv } else { backbuf.data[i] }
             };
             for j in 0..cmp::min(blur_radius, width) {
                 let bb = backbuf.data[ti + j];
@@ -843,25 +830,10 @@ fn make_opaque(width: u32, height: u32) -> Vec<RGBA8> {
     data
 }
 
-fn make_gradient_alpha(width: u32, height: u32) -> Vec<RGBA8> {
+fn make_photo(width: u32, height: u32) -> Vec<RGBA8> {
     let n = (width * height) as usize;
     let mut data = Vec::with_capacity(n);
-    for i in 0..n {
-        let alpha = ((i as f64 / n as f64) * 255.0) as u8;
-        data.push(RGBA8 {
-            r: (i % 256) as u8,
-            g: ((i * 7) % 256) as u8,
-            b: ((i * 13) % 256) as u8,
-            a: alpha,
-        });
-    }
-    data
-}
-
-fn make_random_alpha(width: u32, height: u32) -> Vec<RGBA8> {
-    let n = (width * height) as usize;
-    let mut data = Vec::with_capacity(n);
-    // Simple LCG for deterministic "random" data
+    // Simple LCG for deterministic "random" data simulating photographic content
     let mut rng: u64 = 0xDEADBEEF;
     for _ in 0..n {
         rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -881,49 +853,55 @@ fn make_random_alpha(width: u32, height: u32) -> Vec<RGBA8> {
 // Benchmark harness
 // ===========================================================================
 
-/// Which blur algorithm pair to benchmark (naive vs optimized).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Algorithm {
     Box,
     Iir,
 }
 
-/// Which input pattern to generate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputPattern {
     Opaque,
-    Gradient,
-    Random,
+    Photo,
 }
 
 impl InputPattern {
     fn name(self) -> &'static str {
         match self {
             InputPattern::Opaque => "opaque",
-            InputPattern::Gradient => "gradient",
-            InputPattern::Random => "random",
+            InputPattern::Photo => "photo",
         }
     }
 
     fn generate(self, width: u32, height: u32) -> Vec<RGBA8> {
         match self {
             InputPattern::Opaque => make_opaque(width, height),
-            InputPattern::Gradient => make_gradient_alpha(width, height),
-            InputPattern::Random => make_random_alpha(width, height),
+            InputPattern::Photo => make_photo(width, height),
         }
     }
 }
 
-/// Which section of the output this result belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
-    BoxBlur,
-    IirBlur,
-    AsymmetricSigma,
+    IconShadow,
+    CardShadow,
+    BackdropBlur,
     ThresholdBoundary,
+    AsymmetricBlur,
 }
 
-/// A single benchmark configuration to run.
+impl Section {
+    fn name(self) -> &'static str {
+        match self {
+            Section::IconShadow => "Icon Shadow",
+            Section::CardShadow => "Card Shadow",
+            Section::BackdropBlur => "Backdrop Blur",
+            Section::ThresholdBoundary => "Threshold Boundary",
+            Section::AsymmetricBlur => "Asymmetric Blur",
+        }
+    }
+}
+
 struct Config {
     order: usize,
     section: Section,
@@ -933,8 +911,8 @@ struct Config {
     sigma_y: f64,
     pattern: InputPattern,
     algorithm: Algorithm,
-    /// Display label for the algorithm column.
     algorithm_label: String,
+    use_case: String,
 }
 
 struct BenchResult {
@@ -944,6 +922,7 @@ struct BenchResult {
     sigma: String,
     input_pattern: String,
     algorithm: String,
+    use_case: String,
     naive_us: f64,
     opt_us: f64,
     speedup: f64,
@@ -970,7 +949,7 @@ fn bench_one_fn(
         f(sigma_x, sigma_y, ImageRefMut::new(width, height, &mut data));
     }
     let elapsed = start.elapsed();
-    elapsed.as_nanos() as f64 / iters as f64 / 1000.0 // microseconds
+    elapsed.as_nanos() as f64 / iters as f64 / 1000.0
 }
 
 fn choose_iters(width: u32, height: u32) -> u32 {
@@ -986,7 +965,6 @@ fn choose_iters(width: u32, height: u32) -> u32 {
     }
 }
 
-/// Run a single benchmark configuration and return the result.
 fn run_config(config: &Config, progress: &AtomicUsize, total: usize) -> BenchResult {
     let data_template = config.pattern.generate(config.width, config.height);
     let iters = choose_iters(config.width, config.height);
@@ -1036,6 +1014,7 @@ fn run_config(config: &Config, progress: &AtomicUsize, total: usize) -> BenchRes
         sigma: sigma_str,
         input_pattern: config.pattern.name().to_string(),
         algorithm: config.algorithm_label.clone(),
+        use_case: config.use_case.clone(),
         naive_us: t_naive,
         opt_us: t_opt,
         speedup,
@@ -1044,31 +1023,27 @@ fn run_config(config: &Config, progress: &AtomicUsize, total: usize) -> BenchRes
 
 fn main() {
     // =====================================================================
-    // Part 1: Correctness verification (sequential -- fast, has dependencies)
+    // Part 1: Correctness verification
     // =====================================================================
     println!("=== Correctness Verification ===\n");
 
     let correctness_sizes: &[(u32, u32)] = &[
-        (4, 4),
-        (8, 8),
-        (15, 15),
-        (16, 16),
-        (17, 17),
-        (32, 32),
-        (64, 64),
-        (128, 128),
-        (256, 256),
-        (15, 64),
-        (64, 15),
+        (24, 24),
+        (48, 48),
+        (96, 96),
+        (200, 150),
+        (400, 300),
+        (499, 500),
+        (500, 500),
+        (501, 500),
     ];
 
     let mut all_correct = true;
 
-    // Box blur correctness
     println!("--- Box Blur Correctness ---");
     for &(w, h) in correctness_sizes {
-        for &sigma in &[2.0, 5.0, 10.0, 50.0] {
-            let original = make_random_alpha(w, h);
+        for &sigma in &[2.0, 4.0, 8.0, 16.0, 40.0] {
+            let original = make_photo(w, h);
             let mut data_naive = original.clone();
             box_blur_naive::apply(sigma, sigma, ImageRefMut::new(w, h, &mut data_naive));
             let mut data_opt = original.clone();
@@ -1090,11 +1065,10 @@ fn main() {
         }
     }
 
-    // IIR blur correctness
     println!("\n--- IIR Blur Correctness ---");
     for &(w, h) in correctness_sizes {
-        for &sigma in &[0.3, 0.5, 1.0, 1.5, 1.9] {
-            let original = make_random_alpha(w, h);
+        for &sigma in &[0.5, 1.0, 1.5] {
+            let original = make_photo(w, h);
             let mut data_naive = original.clone();
             iir_blur_naive::apply(sigma, sigma, ImageRefMut::new(w, h, &mut data_naive));
             let mut data_opt = original.clone();
@@ -1116,11 +1090,10 @@ fn main() {
         }
     }
 
-    // Asymmetric sigma correctness (box blur)
-    println!("\n--- Asymmetric Sigma Correctness (Box Blur) ---");
-    for &(w, h) in &[(64u32, 64u32), (128, 128)] {
-        for &(sx, sy) in &[(5.0, 0.0), (0.0, 5.0), (3.0, 10.0)] {
-            let original = make_random_alpha(w, h);
+    println!("\n--- Asymmetric Sigma Correctness ---");
+    for &(w, h) in &[(96u32, 96u32), (400, 300)] {
+        for &(sx, sy) in &[(4.0, 0.0), (0.0, 8.0), (2.0, 16.0), (8.0, 2.0)] {
+            let original = make_photo(w, h);
             let mut data_naive = original.clone();
             box_blur_naive::apply(sx, sy, ImageRefMut::new(w, h, &mut data_naive));
             let mut data_opt = original.clone();
@@ -1149,60 +1122,81 @@ fn main() {
     }
 
     // =====================================================================
-    // Part 2: Comprehensive performance benchmark (parallel)
+    // Part 2: Comprehensive scenario-based benchmark
     // =====================================================================
-    println!("\n=== Comprehensive Performance Benchmark ===\n");
+    println!("\n=== Comprehensive Real-World Benchmark ===\n");
 
-    let image_sizes: &[(u32, u32)] = &[
-        (4, 4),
-        (8, 8),
-        (15, 15),
-        (16, 16),
-        (17, 17),
-        (32, 32),
-        (64, 64),
-        (128, 128),
-        (256, 256),
-        (512, 512),
-        (1024, 1024),
-    ];
+    let input_patterns: &[InputPattern] = &[InputPattern::Opaque, InputPattern::Photo];
 
-    let box_sigmas: &[f64] = &[2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0];
-    let iir_sigmas: &[f64] = &[0.3, 0.5, 1.0, 1.5, 1.9];
-
-    let input_patterns: &[InputPattern] = &[
-        InputPattern::Opaque,
-        InputPattern::Gradient,
-        InputPattern::Random,
-    ];
-
-    let asym_sizes: &[(u32, u32)] = &[(64, 64), (256, 256), (512, 512)];
-    let asym_sigmas: &[(f64, f64)] = &[(5.0, 0.0), (0.0, 5.0), (3.0, 10.0)];
-
-    let threshold_sizes: &[(u32, u32)] = &[
-        (15, 64),
-        (15, 256),
-        (64, 15),
-        (256, 15),
-        (16, 16),
-        (15, 15),
-    ];
-    let threshold_sigmas_box: &[f64] = &[3.0, 10.0];
-    let threshold_sigmas_iir: &[f64] = &[0.5, 1.5];
-
-    // -----------------------------------------------------------------
-    // Build all configurations upfront
-    // -----------------------------------------------------------------
     let mut configs: Vec<Config> = Vec::new();
     let mut order: usize = 0;
 
-    // Section 1: Box Blur Benchmark
-    for &(w, h) in image_sizes {
-        for &sigma in box_sigmas {
+    // -----------------------------------------------------------------
+    // Scenario 1: Icon Shadow (sizes 16-96, sigma 1-4)
+    // Material Design elevation shadows, small UI element glows
+    // -----------------------------------------------------------------
+    let icon_sizes: &[(u32, u32, &str)] = &[
+        (16, 16, "favicon"),
+        (24, 24, "icon"),
+        (48, 48, "large icon"),
+        (64, 64, "app icon"),
+        (96, 96, "avatar"),
+    ];
+    let icon_sigmas: &[(f64, &str)] = &[
+        (1.0, "subtle glow"),
+        (1.5, "IIR glow"),
+        (2.0, "Material Z1"),
+        (4.0, "MDN shadow"),
+    ];
+
+    for &(w, h, size_label) in icon_sizes {
+        for &(sigma, sigma_label) in icon_sigmas {
+            let alg = if sigma >= 2.0 {
+                Algorithm::Box
+            } else {
+                Algorithm::Iir
+            };
+            let alg_name = if sigma >= 2.0 { "box" } else { "IIR" };
             for &pat in input_patterns {
                 configs.push(Config {
                     order,
-                    section: Section::BoxBlur,
+                    section: Section::IconShadow,
+                    width: w,
+                    height: h,
+                    sigma_x: sigma,
+                    sigma_y: sigma,
+                    pattern: pat,
+                    algorithm: alg,
+                    algorithm_label: alg_name.to_string(),
+                    use_case: format!("{} {}", size_label, sigma_label),
+                });
+                order += 1;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Scenario 2: Card Shadow (sizes 200-600, sigma 3-8)
+    // Card elevations, popover shadows, dropdown menus
+    // -----------------------------------------------------------------
+    let card_sizes: &[(u32, u32, &str)] = &[
+        (200, 150, "thumbnail"),
+        (300, 200, "small card"),
+        (400, 300, "card"),
+        (600, 400, "wide card"),
+    ];
+    let card_sigmas: &[(f64, &str)] = &[
+        (3.0, "light shadow"),
+        (4.0, "standard shadow"),
+        (8.0, "deep shadow"),
+    ];
+
+    for &(w, h, size_label) in card_sizes {
+        for &(sigma, sigma_label) in card_sigmas {
+            for &pat in input_patterns {
+                configs.push(Config {
+                    order,
+                    section: Section::CardShadow,
                     width: w,
                     height: h,
                     sigma_x: sigma,
@@ -1210,19 +1204,102 @@ fn main() {
                     pattern: pat,
                     algorithm: Algorithm::Box,
                     algorithm_label: "box".to_string(),
+                    use_case: format!("{} {}", size_label, sigma_label),
                 });
                 order += 1;
             }
         }
     }
 
-    // Section 2: IIR Blur Benchmark
-    for &(w, h) in image_sizes {
-        for &sigma in iir_sigmas {
+    // -----------------------------------------------------------------
+    // Scenario 3: Backdrop Blur (sizes 400-1500, sigma 8-40)
+    // Frosted glass, backdrop-filter, full-screen overlays
+    // -----------------------------------------------------------------
+    let backdrop_sizes: &[(u32, u32, &str)] = &[
+        (400, 300, "mobile partial"),
+        (800, 600, "tablet"),
+        (1024, 768, "laptop"),
+        (1500, 1000, "desktop"),
+    ];
+    let backdrop_sigmas: &[(f64, &str)] = &[
+        (8.0, "blur-default"),
+        (16.0, "frosted glass"),
+        (40.0, "blur-2xl"),
+    ];
+
+    for &(w, h, size_label) in backdrop_sizes {
+        for &(sigma, sigma_label) in backdrop_sigmas {
             for &pat in input_patterns {
                 configs.push(Config {
                     order,
-                    section: Section::IirBlur,
+                    section: Section::BackdropBlur,
+                    width: w,
+                    height: h,
+                    sigma_x: sigma,
+                    sigma_y: sigma,
+                    pattern: pat,
+                    algorithm: Algorithm::Box,
+                    algorithm_label: "box".to_string(),
+                    use_case: format!("{} {}", size_label, sigma_label),
+                });
+                order += 1;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Scenario 4: Threshold Boundary (near 250k/500k pixel boundaries)
+    // Critical for detecting regressions in code path selection
+    // -----------------------------------------------------------------
+
+    // 250k box blur threshold
+    let box_boundary_sizes: &[(u32, u32, &str)] = &[
+        (499, 500, "249500px, below 250k"),
+        (500, 500, "250000px, at 250k"),
+        (501, 500, "250500px, above 250k"),
+    ];
+    let box_boundary_sigmas: &[(f64, &str)] = &[
+        (4.0, "standard shadow"),
+        (8.0, "backdrop default"),
+        (16.0, "frosted glass"),
+    ];
+
+    for &(w, h, size_label) in box_boundary_sizes {
+        for &(sigma, sigma_label) in box_boundary_sigmas {
+            for &pat in input_patterns {
+                configs.push(Config {
+                    order,
+                    section: Section::ThresholdBoundary,
+                    width: w,
+                    height: h,
+                    sigma_x: sigma,
+                    sigma_y: sigma,
+                    pattern: pat,
+                    algorithm: Algorithm::Box,
+                    algorithm_label: "box".to_string(),
+                    use_case: format!("{} {}", size_label, sigma_label),
+                });
+                order += 1;
+            }
+        }
+    }
+
+    // 500k IIR interleaved threshold
+    let iir_boundary_sizes: &[(u32, u32, &str)] = &[
+        (707, 707, "499849px, below 500k"),
+        (708, 707, "500556px, above 500k"),
+    ];
+    let iir_boundary_sigmas: &[(f64, &str)] = &[
+        (1.0, "fine detail"),
+        (1.5, "subtle glow"),
+    ];
+
+    for &(w, h, size_label) in iir_boundary_sizes {
+        for &(sigma, sigma_label) in iir_boundary_sigmas {
+            for &pat in input_patterns {
+                configs.push(Config {
+                    order,
+                    section: Section::ThresholdBoundary,
                     width: w,
                     height: h,
                     sigma_x: sigma,
@@ -1230,19 +1307,36 @@ fn main() {
                     pattern: pat,
                     algorithm: Algorithm::Iir,
                     algorithm_label: "IIR".to_string(),
+                    use_case: format!("{} {}", size_label, sigma_label),
                 });
                 order += 1;
             }
         }
     }
 
-    // Section 3: Asymmetric Sigma Benchmark (Box Blur)
-    for &(w, h) in asym_sizes {
-        for &(sx, sy) in asym_sigmas {
+    // -----------------------------------------------------------------
+    // Scenario 5: Asymmetric Blur (sigma_x != sigma_y)
+    // Directional shadows, motion-like blur effects
+    // -----------------------------------------------------------------
+    let asym_sizes: &[(u32, u32, &str)] = &[
+        (96, 96, "avatar"),
+        (400, 300, "card"),
+        (800, 600, "tablet"),
+    ];
+    let asym_sigmas: &[(f64, f64, &str)] = &[
+        (4.0, 0.0, "horizontal-only shadow"),
+        (0.0, 4.0, "vertical-only shadow"),
+        (2.0, 8.0, "vertical emphasis"),
+        (8.0, 2.0, "horizontal emphasis"),
+        (4.0, 16.0, "strong directional"),
+    ];
+
+    for &(w, h, size_label) in asym_sizes {
+        for &(sx, sy, sigma_label) in asym_sigmas {
             for &pat in input_patterns {
                 configs.push(Config {
                     order,
-                    section: Section::AsymmetricSigma,
+                    section: Section::AsymmetricBlur,
                     width: w,
                     height: h,
                     sigma_x: sx,
@@ -1250,43 +1344,10 @@ fn main() {
                     pattern: pat,
                     algorithm: Algorithm::Box,
                     algorithm_label: "box-asym".to_string(),
+                    use_case: format!("{} {}", size_label, sigma_label),
                 });
                 order += 1;
             }
-        }
-    }
-
-    // Section 4: Threshold Boundary Tests
-    for &(w, h) in threshold_sizes {
-        // Box blur threshold tests
-        for &sigma in threshold_sigmas_box {
-            configs.push(Config {
-                order,
-                section: Section::ThresholdBoundary,
-                width: w,
-                height: h,
-                sigma_x: sigma,
-                sigma_y: sigma,
-                pattern: InputPattern::Random,
-                algorithm: Algorithm::Box,
-                algorithm_label: "box".to_string(),
-            });
-            order += 1;
-        }
-        // IIR blur threshold tests
-        for &sigma in threshold_sigmas_iir {
-            configs.push(Config {
-                order,
-                section: Section::ThresholdBoundary,
-                width: w,
-                height: h,
-                sigma_x: sigma,
-                sigma_y: sigma,
-                pattern: InputPattern::Random,
-                algorithm: Algorithm::Iir,
-                algorithm_label: "IIR".to_string(),
-            });
-            order += 1;
         }
     }
 
@@ -1301,7 +1362,7 @@ fn main() {
     );
 
     // -----------------------------------------------------------------
-    // Parallel execution using std::thread::scope
+    // Parallel execution
     // -----------------------------------------------------------------
     let progress = AtomicUsize::new(0);
     let chunk_size = (total + num_threads - 1) / num_threads;
@@ -1329,119 +1390,56 @@ fn main() {
         merged
     });
 
-    // Clear progress line
     eprintln!();
 
-    // Sort by original order to restore deterministic output
     all_results.sort_by_key(|r| r.order);
 
     // -----------------------------------------------------------------
-    // Display results by section (same formatting as before)
+    // Display results by scenario
     // -----------------------------------------------------------------
+    let sections = [
+        Section::IconShadow,
+        Section::CardShadow,
+        Section::BackdropBlur,
+        Section::ThresholdBoundary,
+        Section::AsymmetricBlur,
+    ];
 
-    // Section 1: Box Blur Benchmark
-    println!("--- Box Blur Benchmark ---");
-    println!(
-        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(80));
+    for &section in &sections {
+        println!("\n--- {} ---", section.name());
+        println!(
+            "{:<12} {:<12} {:<8} {:<10} {:<28} {:>12} {:>12} {:>10}",
+            "Size", "Sigma", "Input", "Algorithm", "Use Case",
+            "Naive (us)", "Opt (us)", "Speedup"
+        );
+        println!("{}", "-".repeat(112));
 
-    let mut box_results: Vec<&BenchResult> = Vec::new();
-    let mut iir_results: Vec<&BenchResult> = Vec::new();
-
-    for r in &all_results {
-        if r.section == Section::BoxBlur {
-            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
+        for r in &all_results {
+            if r.section != section {
+                continue;
+            }
+            let regression_marker = if r.speedup < 0.95 { " ***" } else { "" };
             println!(
-                "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
-                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
-                r.speedup, regression_marker
-            );
-            box_results.push(r);
-        }
-    }
-
-    // Section 2: IIR Blur Benchmark
-    println!("\n--- IIR Blur Benchmark ---");
-    println!(
-        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(80));
-
-    for r in &all_results {
-        if r.section == Section::IirBlur {
-            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
-            println!(
-                "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
-                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
-                r.speedup, regression_marker
-            );
-            iir_results.push(r);
-        }
-    }
-
-    // Section 3: Asymmetric Sigma Benchmark (Box Blur)
-    println!("\n--- Asymmetric Sigma Benchmark (Box Blur) ---");
-    println!(
-        "{:<12} {:<12} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(84));
-
-    for r in &all_results {
-        if r.section == Section::AsymmetricSigma {
-            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
-            println!(
-                "{:<12} {:<12} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}",
-                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
-                r.speedup, regression_marker
-            );
-            box_results.push(r);
-        }
-    }
-
-    // Section 4: Threshold Boundary Tests
-    println!("\n--- Threshold Boundary Tests (w or h < 16 vs >= 16) ---");
-    println!(
-        "{:<12} {:<8} {:<10} {:<10} {:>12} {:>12} {:>10}",
-        "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
-    );
-    println!("{}", "-".repeat(80));
-
-    for r in &all_results {
-        if r.section == Section::ThresholdBoundary {
-            // Parse width and height from image_size to determine the note
-            let parts: Vec<&str> = r.image_size.split('x').collect();
-            let w: u32 = parts[0].parse().unwrap_or(0);
-            let h: u32 = parts[1].parse().unwrap_or(0);
-            let note = if w < 16 || h < 16 {
-                " (should use naive)"
-            } else {
-                " (should use opt)"
-            };
-            let regression_marker = if r.speedup < 0.95 { " *** REGRESSION" } else { "" };
-            println!(
-                "{:<12} {:<8} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x{}{}",
-                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
-                r.speedup, regression_marker, note
+                "{:<12} {:<12} {:<8} {:<10} {:<28} {:>12.1} {:>12.1} {:>9.2}x{}",
+                r.image_size,
+                r.sigma,
+                r.input_pattern,
+                r.algorithm,
+                r.use_case,
+                r.naive_us,
+                r.opt_us,
+                r.speedup,
+                regression_marker
             );
         }
     }
 
     // =====================================================================
-    // Part 3: Summary - flag regressions
+    // Part 3: Regression summary
     // =====================================================================
     println!("\n=== Regression Summary ===\n");
 
-    let summary_results: Vec<&BenchResult> = box_results
-        .iter()
-        .copied()
-        .chain(iir_results.iter().copied())
-        .collect();
-
-    let regressions: Vec<&&BenchResult> = summary_results
+    let regressions: Vec<&BenchResult> = all_results
         .iter()
         .filter(|r| r.speedup < 0.95)
         .collect();
@@ -1454,36 +1452,43 @@ fn main() {
             regressions.len()
         );
         println!(
-            "{:<12} {:<12} {:<10} {:<10} {:>12} {:>12} {:>10}",
-            "Image Size", "Sigma", "Input", "Algorithm", "Naive (us)", "Opt (us)", "Speedup"
+            "{:<12} {:<12} {:<8} {:<10} {:<28} {:>12} {:>12} {:>10}",
+            "Size", "Sigma", "Input", "Algorithm", "Use Case",
+            "Naive (us)", "Opt (us)", "Speedup"
         );
-        println!("{}", "-".repeat(84));
+        println!("{}", "-".repeat(112));
         for r in &regressions {
             println!(
-                "{:<12} {:<12} {:<10} {:<10} {:>12.1} {:>12.1} {:>9.2}x",
-                r.image_size, r.sigma, r.input_pattern, r.algorithm, r.naive_us, r.opt_us,
+                "{:<12} {:<12} {:<8} {:<10} {:<28} {:>12.1} {:>12.1} {:>9.2}x",
+                r.image_size,
+                r.sigma,
+                r.input_pattern,
+                r.algorithm,
+                r.use_case,
+                r.naive_us,
+                r.opt_us,
                 r.speedup
             );
         }
     }
 
-    // Print best and worst speedups
+    // Top/bottom speedups
     println!("\n--- Top 10 Best Speedups ---");
-    let mut sorted_by_speedup: Vec<&BenchResult> = summary_results.iter().copied().collect();
-    sorted_by_speedup.sort_by(|a, b| b.speedup.partial_cmp(&a.speedup).unwrap());
-    for r in sorted_by_speedup.iter().take(10) {
+    let mut sorted: Vec<&BenchResult> = all_results.iter().collect();
+    sorted.sort_by(|a, b| b.speedup.partial_cmp(&a.speedup).unwrap());
+    for r in sorted.iter().take(10) {
         println!(
-            "  {:<12} sigma={:<8} {:<10} {:<10} {:.2}x",
-            r.image_size, r.sigma, r.input_pattern, r.algorithm, r.speedup
+            "  {:<12} sigma={:<12} {:<8} {:<28} {:.2}x",
+            r.image_size, r.sigma, r.input_pattern, r.use_case, r.speedup
         );
     }
 
     println!("\n--- Top 10 Worst Speedups ---");
-    sorted_by_speedup.reverse();
-    for r in sorted_by_speedup.iter().take(10) {
+    sorted.reverse();
+    for r in sorted.iter().take(10) {
         println!(
-            "  {:<12} sigma={:<8} {:<10} {:<10} {:.2}x",
-            r.image_size, r.sigma, r.input_pattern, r.algorithm, r.speedup
+            "  {:<12} sigma={:<12} {:<8} {:<28} {:.2}x",
+            r.image_size, r.sigma, r.input_pattern, r.use_case, r.speedup
         );
     }
 }

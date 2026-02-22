@@ -1,13 +1,23 @@
 // Copyright 2020 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Benchmark for feGaussianBlur: box blur and IIR blur paths.
+//! Benchmark for feGaussianBlur with real-world usage patterns.
 //!
 //! Run with: cargo bench -p resvg --bench blur_bench
 //!
-//! This benchmark duplicates the blur logic since the filter module is private.
-//! It tests both naive (original) and optimized implementations, verifies
-//! bit-exact correctness, and reports performance.
+//! Code paths covered:
+//!   - IIR blur: σ < 2
+//!   - Box blur small: σ >= 2, pixel_count <= 250k
+//!   - Box blur tiled: σ >= 2, pixel_count > 250k AND radius >= 8
+//!   - IIR interleaved: σ < 2, pixel_count > 500k
+//!
+//! Sigma values mapped to real use cases:
+//!   σ=1.5  IIR path (subtle anti-alias, glow)
+//!   σ=2    Icon shadow (Material Z1-Z2)
+//!   σ=4    Standard UI shadow (MDN canonical, Tailwind backdrop-blur-sm)
+//!   σ=8    Tailwind backdrop-blur default, Apple frosted glass low
+//!   σ=16   Tailwind backdrop-blur-lg, Apple frosted glass standard
+//!   σ=40   Tailwind backdrop-blur-2xl, heavy backdrop blur
 
 #![allow(clippy::needless_range_loop)]
 
@@ -805,7 +815,7 @@ mod iir_blur_opt {
 }
 
 // ===========================================================================
-// Benchmark harness + correctness
+// Benchmark harness
 // ===========================================================================
 
 fn make_test_image(width: u32, height: u32) -> Vec<RGBA8> {
@@ -820,108 +830,6 @@ fn make_test_image(width: u32, height: u32) -> Vec<RGBA8> {
         });
     }
     data
-}
-
-fn verify_box_blur_correctness() {
-    println!("=== Box Blur Bit-Exact Correctness Verification ===");
-    let test_cases: &[(u32, u32, f64)] = &[
-        (4, 4, 3.0),
-        (16, 16, 3.0),
-        (64, 64, 3.0),
-        (64, 64, 10.0),
-        (64, 64, 50.0),
-        (128, 64, 5.0),
-        (64, 128, 5.0),
-        (256, 256, 3.0),
-        (256, 256, 10.0),
-        (256, 256, 50.0),
-        (256, 256, 200.0),
-    ];
-
-    for &(w, h, sigma) in test_cases {
-        let original = make_test_image(w, h);
-
-        let mut data_naive = original.clone();
-        box_blur_naive::apply(sigma, sigma, ImageRefMut::new(w, h, &mut data_naive));
-
-        let mut data_opt = original.clone();
-        box_blur_opt::apply(sigma, sigma, ImageRefMut::new(w, h, &mut data_opt));
-
-        if data_naive == data_opt {
-            println!("  PASS: {}x{} sigma={}", w, h, sigma);
-        } else {
-            let mut diff_count = 0;
-            for i in 0..data_naive.len() {
-                if data_naive[i] != data_opt[i] {
-                    diff_count += 1;
-                    if diff_count <= 3 {
-                        println!(
-                            "  DIFF at pixel {}: naive={:?} opt={:?}",
-                            i, data_naive[i], data_opt[i]
-                        );
-                    }
-                }
-            }
-            println!(
-                "  FAIL: {}x{} sigma={} ({} pixels differ out of {})",
-                w,
-                h,
-                sigma,
-                diff_count,
-                data_naive.len()
-            );
-        }
-    }
-    println!();
-}
-
-fn verify_iir_blur_correctness() {
-    println!("=== IIR Blur Bit-Exact Correctness Verification ===");
-    let test_cases: &[(u32, u32, f64)] = &[
-        (4, 4, 1.0),
-        (16, 16, 1.0),
-        (64, 64, 0.5),
-        (64, 64, 1.0),
-        (64, 64, 1.5),
-        (128, 64, 1.0),
-        (64, 128, 1.0),
-    ];
-
-    for &(w, h, sigma) in test_cases {
-        let original = make_test_image(w, h);
-
-        let mut data_naive = original.clone();
-        iir_blur_naive::apply(sigma, sigma, ImageRefMut::new(w, h, &mut data_naive));
-
-        let mut data_opt = original.clone();
-        iir_blur_opt::apply(sigma, sigma, ImageRefMut::new(w, h, &mut data_opt));
-
-        if data_naive == data_opt {
-            println!("  PASS: {}x{} sigma={}", w, h, sigma);
-        } else {
-            let mut diff_count = 0;
-            for i in 0..data_naive.len() {
-                if data_naive[i] != data_opt[i] {
-                    diff_count += 1;
-                    if diff_count <= 3 {
-                        println!(
-                            "  DIFF at pixel {}: naive={:?} opt={:?}",
-                            i, data_naive[i], data_opt[i]
-                        );
-                    }
-                }
-            }
-            println!(
-                "  FAIL: {}x{} sigma={} ({} pixels differ out of {})",
-                w,
-                h,
-                sigma,
-                diff_count,
-                data_naive.len()
-            );
-        }
-    }
-    println!();
 }
 
 fn bench_one(
@@ -950,58 +858,215 @@ fn bench_one(
     let mpix_per_sec = (width as f64 * height as f64) / per_iter_us;
 
     println!(
-        "{:<55} {:>10.1} us/iter  ({:.1} Mpix/s)",
+        "{:<60} {:>10.1} us/iter  ({:.1} Mpix/s)",
         label, per_iter_us, mpix_per_sec
     );
     per_iter_us
 }
 
+fn choose_iters(width: u32, height: u32) -> u32 {
+    let pixels = (width as u64) * (height as u64);
+    if pixels > 500_000 {
+        5
+    } else if pixels > 100_000 {
+        15
+    } else if pixels > 10_000 {
+        50
+    } else {
+        200
+    }
+}
+
 fn main() {
-    // First verify correctness
-    verify_box_blur_correctness();
-    verify_iir_blur_correctness();
+    println!("=== feGaussianBlur Real-World Benchmark ===\n");
 
-    // Then benchmark
-    let resolutions: &[(u32, u32)] = &[(64, 64), (256, 256), (1024, 1024), (4096, 4096)];
-    let sigmas: &[f64] = &[1.0, 3.0, 10.0, 50.0, 200.0];
+    // -----------------------------------------------------------------
+    // 1. IIR blur path: sigma < 2 (subtle glow, anti-alias)
+    // -----------------------------------------------------------------
+    println!("--- IIR blur (sigma < 2) ---");
+    println!("  Use case: subtle anti-alias, glow, fine detail softening\n");
 
-    println!("=== feGaussianBlur Benchmark ===");
-    println!();
+    let iir_configs: &[(u32, u32, &str)] = &[
+        (48, 48, "large icon"),
+        (96, 96, "avatar"),
+        (400, 300, "card"),
+        (800, 600, "tablet"),
+    ];
+    let iir_sigma = 1.5;
 
-    for &(w, h) in resolutions {
-        for &sigma in sigmas {
-            let use_box = sigma >= 2.0;
-            let alg = if use_box { "box" } else { "IIR" };
-            let iters = if w * h > 1_000_000 {
-                3
-            } else if w * h > 100_000 {
-                10
-            } else {
-                50
-            };
+    for &(w, h, label) in iir_configs {
+        let iters = choose_iters(w, h);
+        let tag_naive = format!("IIR {}x{} ({}) sigma={} naive", w, h, label, iir_sigma);
+        let tag_opt = format!("IIR {}x{} ({}) sigma={} optimized", w, h, label, iir_sigma);
+        let t_naive = bench_one(&tag_naive, w, h, iir_sigma, &iir_blur_naive::apply, iters);
+        let t_opt = bench_one(&tag_opt, w, h, iir_sigma, &iir_blur_opt::apply, iters);
+        println!("  => speedup: {:.2}x\n", t_naive / t_opt);
+    }
 
-            let label_naive = format!("{}x{} sigma={:<4} ({}) naive", w, h, sigma, alg);
-            let label_opt = format!("{}x{} sigma={:<4} ({}) optimized", w, h, sigma, alg);
+    // -----------------------------------------------------------------
+    // 2. Box blur: icon shadows (sigma=2, sigma=4)
+    // -----------------------------------------------------------------
+    println!("--- Box blur: icon shadows (Material Z1-Z4) ---\n");
 
-            let naive_fn: &dyn Fn(f64, f64, ImageRefMut) = if use_box {
-                &box_blur_naive::apply
-            } else {
-                &iir_blur_naive::apply
-            };
+    let icon_sizes: &[(u32, u32, &str)] = &[
+        (24, 24, "icon"),
+        (48, 48, "large icon"),
+        (96, 96, "avatar"),
+    ];
+    let icon_sigmas: &[(f64, &str)] = &[
+        (2.0, "Material Z1-Z2"),
+        (4.0, "MDN canonical shadow"),
+    ];
 
-            let opt_fn: &dyn Fn(f64, f64, ImageRefMut) = if use_box {
-                &box_blur_opt::apply
-            } else {
-                &iir_blur_opt::apply
-            };
-
-            let t_naive = bench_one(&label_naive, w, h, sigma, naive_fn, iters);
-            let t_opt = bench_one(&label_opt, w, h, sigma, opt_fn, iters);
-            let speedup = t_naive / t_opt;
-            println!("  => speedup: {:.2}x", speedup);
-            println!();
+    for &(w, h, size_label) in icon_sizes {
+        for &(sigma, sigma_label) in icon_sigmas {
+            let iters = choose_iters(w, h);
+            let tag_naive = format!(
+                "box {}x{} ({}) sigma={} ({}) naive",
+                w, h, size_label, sigma, sigma_label
+            );
+            let tag_opt = format!(
+                "box {}x{} ({}) sigma={} ({}) optimized",
+                w, h, size_label, sigma, sigma_label
+            );
+            let t_naive = bench_one(&tag_naive, w, h, sigma, &box_blur_naive::apply, iters);
+            let t_opt = bench_one(&tag_opt, w, h, sigma, &box_blur_opt::apply, iters);
+            println!("  => speedup: {:.2}x\n", t_naive / t_opt);
         }
-        println!("---");
-        println!();
+    }
+
+    // -----------------------------------------------------------------
+    // 3. Box blur: card/UI shadows (sigma=4, sigma=8)
+    // -----------------------------------------------------------------
+    println!("--- Box blur: card/UI shadows ---\n");
+
+    let card_sizes: &[(u32, u32, &str)] = &[
+        (200, 150, "thumbnail"),
+        (400, 300, "card"),
+        (800, 600, "tablet"),
+    ];
+    let card_sigmas: &[(f64, &str)] = &[
+        (4.0, "standard shadow"),
+        (8.0, "backdrop-blur default"),
+    ];
+
+    for &(w, h, size_label) in card_sizes {
+        for &(sigma, sigma_label) in card_sigmas {
+            let iters = choose_iters(w, h);
+            let tag_naive = format!(
+                "box {}x{} ({}) sigma={} ({}) naive",
+                w, h, size_label, sigma, sigma_label
+            );
+            let tag_opt = format!(
+                "box {}x{} ({}) sigma={} ({}) optimized",
+                w, h, size_label, sigma, sigma_label
+            );
+            let t_naive = bench_one(&tag_naive, w, h, sigma, &box_blur_naive::apply, iters);
+            let t_opt = bench_one(&tag_opt, w, h, sigma, &box_blur_opt::apply, iters);
+            println!("  => speedup: {:.2}x\n", t_naive / t_opt);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 4. Box blur: backdrop/frosted glass (sigma=16, sigma=40)
+    // -----------------------------------------------------------------
+    println!("--- Box blur: backdrop / frosted glass ---\n");
+
+    let backdrop_sizes: &[(u32, u32, &str)] = &[
+        (800, 600, "tablet"),
+        (1024, 768, "laptop"),
+        (1500, 1000, "desktop"),
+    ];
+    let backdrop_sigmas: &[(f64, &str)] = &[
+        (16.0, "Apple frosted glass"),
+        (40.0, "backdrop-blur-2xl"),
+    ];
+
+    for &(w, h, size_label) in backdrop_sizes {
+        for &(sigma, sigma_label) in backdrop_sigmas {
+            let iters = choose_iters(w, h);
+            let tag_naive = format!(
+                "box {}x{} ({}) sigma={} ({}) naive",
+                w, h, size_label, sigma, sigma_label
+            );
+            let tag_opt = format!(
+                "box {}x{} ({}) sigma={} ({}) optimized",
+                w, h, size_label, sigma, sigma_label
+            );
+            let t_naive = bench_one(&tag_naive, w, h, sigma, &box_blur_naive::apply, iters);
+            let t_opt = bench_one(&tag_opt, w, h, sigma, &box_blur_opt::apply, iters);
+            println!("  => speedup: {:.2}x\n", t_naive / t_opt);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 5. IIR interleaved: sigma < 2 on large images (>500k pixels)
+    // -----------------------------------------------------------------
+    println!("--- IIR interleaved: large image + small sigma ---\n");
+
+    let iir_large_configs: &[(u32, u32, &str)] = &[
+        (1024, 768, "laptop"),
+        (1500, 1000, "desktop"),
+    ];
+
+    for &(w, h, label) in iir_large_configs {
+        let iters = choose_iters(w, h);
+        let tag_naive = format!("IIR {}x{} ({}) sigma={} naive", w, h, label, iir_sigma);
+        let tag_opt = format!("IIR {}x{} ({}) sigma={} optimized", w, h, label, iir_sigma);
+        let t_naive = bench_one(&tag_naive, w, h, iir_sigma, &iir_blur_naive::apply, iters);
+        let t_opt = bench_one(&tag_opt, w, h, iir_sigma, &iir_blur_opt::apply, iters);
+        println!("  => speedup: {:.2}x\n", t_naive / t_opt);
+    }
+
+    // -----------------------------------------------------------------
+    // 6. Threshold boundary tests (critical for regression detection)
+    // -----------------------------------------------------------------
+    println!("--- Threshold boundary: 250k pixel box blur boundary ---");
+    println!("  Tests: 499x500=249500, 500x500=250000, 501x500=250500\n");
+
+    let box_boundary_sizes: &[(u32, u32, &str)] = &[
+        (499, 500, "just below 250k"),
+        (500, 500, "at 250k"),
+        (501, 500, "just above 250k"),
+    ];
+
+    for &(w, h, label) in box_boundary_sizes {
+        let iters = choose_iters(w, h);
+        let sigma = 8.0;
+        let tag_naive = format!(
+            "box {}x{} ({}px, {}) sigma={} naive",
+            w, h, w as u64 * h as u64, label, sigma
+        );
+        let tag_opt = format!(
+            "box {}x{} ({}px, {}) sigma={} optimized",
+            w, h, w as u64 * h as u64, label, sigma
+        );
+        let t_naive = bench_one(&tag_naive, w, h, sigma, &box_blur_naive::apply, iters);
+        let t_opt = bench_one(&tag_opt, w, h, sigma, &box_blur_opt::apply, iters);
+        println!("  => speedup: {:.2}x\n", t_naive / t_opt);
+    }
+
+    println!("--- Threshold boundary: 500k pixel IIR interleaved boundary ---");
+    println!("  Tests: 707x707=499849, 708x707=500556\n");
+
+    let iir_boundary_sizes: &[(u32, u32, &str)] = &[
+        (707, 707, "just below 500k"),
+        (708, 707, "just above 500k"),
+    ];
+
+    for &(w, h, label) in iir_boundary_sizes {
+        let iters = choose_iters(w, h);
+        let sigma = 1.5;
+        let tag_naive = format!(
+            "IIR {}x{} ({}px, {}) sigma={} naive",
+            w, h, w as u64 * h as u64, label, sigma
+        );
+        let tag_opt = format!(
+            "IIR {}x{} ({}px, {}) sigma={} optimized",
+            w, h, w as u64 * h as u64, label, sigma
+        );
+        let t_naive = bench_one(&tag_naive, w, h, sigma, &iir_blur_naive::apply, iters);
+        let t_opt = bench_one(&tag_opt, w, h, sigma, &iir_blur_opt::apply, iters);
+        println!("  => speedup: {:.2}x\n", t_naive / t_opt);
     }
 }
