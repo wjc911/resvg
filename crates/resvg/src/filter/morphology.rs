@@ -5,9 +5,10 @@ use super::ImageRefMut;
 use rgb::RGBA8;
 use usvg::filter::MorphologyOperator;
 
-// For small kernels, the naive O(n*r^2) approach is faster than vHGW due to
-// lower overhead. This threshold is the maximum kernel area (columns * rows)
-// for which we use the naive path.
+// Maximum kernel area (columns * rows) for which we use the naive O(n*r^2) path
+// instead of vHGW. A 3x3 kernel (area 9) does ~9 comparisons per pixel, which
+// is competitive with vHGW's ~6 comparisons plus prefix/suffix scan overhead.
+// Empirical benchmarks show the crossover is around this point.
 const NAIVE_KERNEL_AREA_THRESHOLD: u32 = 9;
 
 /// Applies a morphology filter.
@@ -21,6 +22,9 @@ pub fn apply(operator: MorphologyOperator, rx: f32, ry: f32, src: ImageRefMut) {
     let columns = std::cmp::min(rx.ceil() as u32 * 2, src.width);
     let rows = std::cmp::min(ry.ceil() as u32 * 2, src.height);
 
+    // For large kernels, dispatch to the vHGW O(n) algorithm. It is marked
+    // #[cold] / #[inline(never)] so that its code stays out of this function's
+    // icache footprint, keeping the small-kernel hot path compact.
     if columns * rows > NAIVE_KERNEL_AREA_THRESHOLD {
         match operator {
             MorphologyOperator::Erode => apply_vhgw::<ErodeOp>(columns, rows, src),
@@ -29,7 +33,7 @@ pub fn apply(operator: MorphologyOperator, rx: f32, ry: f32, src: ImageRefMut) {
         return;
     }
 
-    // Inline naive O(n × r²) morphology for small kernels.
+    // Inline naive O(n * r^2) morphology for small kernels.
     let target_x = (columns as f32 / 2.0).floor() as u32;
     let target_y = (rows as f32 / 2.0).floor() as u32;
 
@@ -86,7 +90,8 @@ pub fn apply(operator: MorphologyOperator, rx: f32, ry: f32, src: ImageRefMut) {
     src.data.copy_from_slice(buf.data);
 }
 
-/// Original naive O(n × r²) morphology — standalone version for testing/benchmarking.
+// Standalone naive O(n * r^2) morphology used as a reference implementation
+// for correctness tests (comparing against vHGW) and benchmarks.
 fn apply_naive(operator: MorphologyOperator, columns: u32, rows: u32, src: ImageRefMut) {
     let target_x = (columns as f32 / 2.0).floor() as u32;
     let target_y = (rows as f32 / 2.0).floor() as u32;
@@ -196,17 +201,17 @@ impl MorphOp for DilateOp {
     }
 }
 
-/// 1D van Herk/Gil-Werman pass.
-///
-/// - `input`: source pixels of length `n`
-/// - `output`: destination slice of length `n`
-/// - `win`: window size (columns or rows)
-/// - `target`: offset of the target pixel within the window (floor(win/2))
-/// - `prefix`, `suffix`, `padded`: pre-allocated scratch buffers
-///
-/// The padded buffer is materialized explicitly (rather than computed
-/// virtually) because it produces branch-free inner loops that the
-/// compiler vectorizes more effectively.
+// 1D van Herk/Gil-Werman pass.
+//
+// - `input`: source pixels of length `n`
+// - `output`: destination slice of length `n`
+// - `win`: window size (columns or rows)
+// - `target`: offset of the target pixel within the window (floor(win/2))
+// - `prefix`, `suffix`, `padded`: pre-allocated scratch buffers
+//
+// The padded buffer is materialized explicitly (rather than computed
+// virtually) because it produces branch-free inner loops that the
+// compiler vectorizes more effectively.
 fn vhgw_1d<Op: MorphOp>(
     input: &[[u8; 4]],
     output: &mut [[u8; 4]],
@@ -262,7 +267,7 @@ fn vhgw_1d<Op: MorphOp>(
     }
 }
 
-/// Separable vHGW morphology: horizontal pass then vertical pass.
+// Separable vHGW morphology: horizontal pass then vertical pass.
 #[cold]
 #[inline(never)]
 fn apply_vhgw<Op: MorphOp>(columns: u32, rows: u32, src: ImageRefMut) {
@@ -347,15 +352,6 @@ fn apply_vhgw<Op: MorphOp>(columns: u32, rows: u32, src: ImageRefMut) {
             }
             x = tile_end;
         }
-    }
-}
-
-/// Public wrapper around the vHGW algorithm for benchmarking.
-#[doc(hidden)]
-pub fn apply_vhgw_pub(operator: MorphologyOperator, columns: u32, rows: u32, src: ImageRefMut) {
-    match operator {
-        MorphologyOperator::Erode => apply_vhgw::<ErodeOp>(columns, rows, src),
-        MorphologyOperator::Dilate => apply_vhgw::<DilateOp>(columns, rows, src),
     }
 }
 
