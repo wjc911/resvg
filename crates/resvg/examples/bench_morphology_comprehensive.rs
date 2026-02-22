@@ -1,7 +1,17 @@
 // Comprehensive performance benchmark for feMorphology filter optimization.
 //
-// Tests naive O(n*r^2) vs production apply() (which dispatches to naive or vHGW)
-// across all combinations of image sizes, radii, operators, and input patterns.
+// Scenarios modelled after real-world SVG morphology usage:
+//   - Icon text outline (dilate r=2, small images)
+//   - Heading outline (dilate r=3-4, medium images)
+//   - Subtle erode (erode r=1, various sizes)
+//   - Thick knockout (dilate r=8, stress test for vHGW)
+//   - Threshold boundary (radii near NAIVE_KERNEL_AREA_THRESHOLD=9)
+//   - Non-square images (real aspect ratios like 200x150, 400x300)
+//   - Asymmetric radius (directional effects: rx!=ry)
+//
+// Input patterns:
+//   - "opaque": solid RGBA with random RGB, alpha=255 (typical rendered content)
+//   - "text-like": sparse alpha simulating text glyph maps (bright on transparent)
 //
 // Uses multithreading via std::thread::scope for faster execution.
 //
@@ -24,7 +34,9 @@ const NAIVE_KERNEL_AREA_THRESHOLD: u32 = 9;
 
 struct Config {
     order: usize,
-    size: u32,
+    scenario: &'static str,
+    width: u32,
+    height: u32,
     rx: f32,
     ry: f32,
     operator: MorphologyOperator,
@@ -36,6 +48,8 @@ struct Config {
 // Image generators
 // ---------------------------------------------------------------------------
 
+/// Solid RGBA pixels with random RGB values, alpha=255.
+/// Represents typical fully-rendered content (icons, backgrounds).
 fn make_opaque(w: u32, h: u32, seed: u64) -> Vec<RGBA8> {
     let mut data = Vec::with_capacity((w * h) as usize);
     let mut state = seed;
@@ -54,23 +68,10 @@ fn make_opaque(w: u32, h: u32, seed: u64) -> Vec<RGBA8> {
     data
 }
 
-fn make_gradient(w: u32, h: u32) -> Vec<RGBA8> {
-    let mut data = Vec::with_capacity((w * h) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            let v = ((x as f32 / w.max(1) as f32 + y as f32 / h.max(1) as f32) * 127.5) as u8;
-            data.push(RGBA8 {
-                r: v,
-                g: v,
-                b: v,
-                a: 255,
-            });
-        }
-    }
-    data
-}
-
-fn make_sparse50(w: u32, h: u32, seed: u64) -> Vec<RGBA8> {
+/// Sparse alpha simulating text glyph alpha maps: ~30% of pixels have bright
+/// foreground (high alpha, white-ish RGB), the rest are fully transparent.
+/// This matches how SVG text outlines look before morphology is applied.
+fn make_text_like(w: u32, h: u32, seed: u64) -> Vec<RGBA8> {
     let mut data = Vec::with_capacity((w * h) as usize);
     let mut state = seed;
     for _ in 0..(w * h) {
@@ -78,20 +79,23 @@ fn make_sparse50(w: u32, h: u32, seed: u64) -> Vec<RGBA8> {
         state ^= state >> 7;
         state ^= state << 17;
         let bytes = state.to_le_bytes();
-        let transparent = bytes[4] < 128;
-        if transparent {
+        // ~30% coverage: text glyphs are sparse
+        let is_glyph = bytes[4] < 77; // 77/256 ~ 30%
+        if is_glyph {
+            // Bright foreground pixel (premultiplied alpha)
+            let a = 200u8.saturating_add(bytes[5] & 0x3F); // alpha 200-255
+            data.push(RGBA8 {
+                r: a,
+                g: a,
+                b: a,
+                a,
+            });
+        } else {
             data.push(RGBA8 {
                 r: 0,
                 g: 0,
                 b: 0,
                 a: 0,
-            });
-        } else {
-            data.push(RGBA8 {
-                r: bytes[0],
-                g: bytes[1],
-                b: bytes[2],
-                a: bytes[3],
             });
         }
     }
@@ -112,26 +116,22 @@ fn median(values: &mut [Duration]) -> Duration {
     }
 }
 
-fn iterations_for_config(size: u32, rx: f32, ry: f32) -> usize {
-    // Estimate work: pixels * kernel_area for naive path
-    let pixels = (size as u64) * (size as u64);
-    let columns = std::cmp::min(rx.ceil() as u64 * 2, size as u64);
-    let rows = std::cmp::min(ry.ceil() as u64 * 2, size as u64);
+fn iterations_for_config(w: u32, h: u32, rx: f32, ry: f32) -> usize {
+    let pixels = (w as u64) * (h as u64);
+    let columns = std::cmp::min(rx.ceil() as u64 * 2, w as u64);
+    let rows = std::cmp::min(ry.ceil() as u64 * 2, h as u64);
     let kernel_area = columns * rows;
     let naive_work = pixels * kernel_area;
 
-    // Target: each config completes within ~0.5 second for naive path.
-    // Approximate cost: ~1ns per pixel*kernel element (rough estimate).
-    // So 500_000_000 ns / (naive_work * 1ns) = iterations.
-    let base = if size <= 32 {
+    // Target: each config completes within ~0.5s for naive path.
+    let base = if pixels <= 1024 {
         10_000
-    } else if size <= 256 {
+    } else if pixels <= 65536 {
         1_000
     } else {
         100
     };
 
-    // Cap iterations so naive doesn't run forever
     let max_from_work = if naive_work > 0 {
         (200_000_000u64 / naive_work).max(5) as usize
     } else {
@@ -147,6 +147,7 @@ fn iterations_for_config(size: u32, rx: f32, ry: f32) -> usize {
 
 struct BenchResult {
     order: usize,
+    scenario: String,
     image_size: String,
     radius: String,
     operator: String,
@@ -155,19 +156,17 @@ struct BenchResult {
     prod_us: f64,
     speedup: f64,
     status: String,
-    path: String, // which path production used: "naive" or "vhgw"
+    path: String,
 }
 
-fn bench_one(
-    w: u32,
-    h: u32,
-    rx: f32,
-    ry: f32,
-    operator: MorphologyOperator,
-    base_data: &[RGBA8],
-    pattern_name: &str,
-    iterations: usize,
-) -> BenchResult {
+fn bench_one(cfg: &Config, base_data: &[RGBA8]) -> BenchResult {
+    let w = cfg.width;
+    let h = cfg.height;
+    let rx = cfg.rx;
+    let ry = cfg.ry;
+    let operator = cfg.operator;
+    let iterations = cfg.iterations;
+
     let columns = std::cmp::min(rx.ceil() as u32 * 2, w);
     let rows = std::cmp::min(ry.ceil() as u32 * 2, h);
     let kernel_area = columns * rows;
@@ -221,11 +220,12 @@ fn bench_one(
     };
 
     BenchResult {
-        order: 0, // caller will set this
+        order: cfg.order,
+        scenario: cfg.scenario.to_string(),
         image_size: format!("{}x{}", w, h),
         radius: format!("rx={:.1},ry={:.1}", rx, ry),
         operator: op_name.to_string(),
-        input_pattern: pattern_name.to_string(),
+        input_pattern: cfg.pattern.to_string(),
         naive_us,
         prod_us,
         speedup,
@@ -235,48 +235,167 @@ fn bench_one(
 }
 
 fn main() {
-    let sizes: &[u32] = &[4, 16, 32, 64, 128, 256, 512, 1024];
-
-    let radii: &[(f32, f32, &str)] = &[
-        (0.5, 0.5, "rx=0.5,ry=0.5 (1x1)"),
-        (1.0, 1.0, "rx=1.0,ry=1.0 (2x2)"),
-        (1.5, 1.5, "rx=1.5,ry=1.5 (3x3=9)"),
-        (2.0, 2.0, "rx=2.0,ry=2.0 (4x4=16)"),
-        (3.0, 3.0, "rx=3.0,ry=3.0 (6x6)"),
-        (5.0, 5.0, "rx=5.0,ry=5.0 (10x10)"),
-        (10.0, 10.0, "rx=10.0,ry=10.0 (20x20)"),
-        (20.0, 20.0, "rx=20.0,ry=20.0 (40x40)"),
-        (1.0, 5.0, "rx=1.0,ry=5.0 (asym)"),
-        (5.0, 1.0, "rx=5.0,ry=1.0 (asym)"),
-        (50.0, 50.0, "rx=50.0,ry=50.0 (extreme)"),
-    ];
-
-    let operators = [MorphologyOperator::Erode, MorphologyOperator::Dilate];
-    let patterns: &[&'static str] = &["opaque", "gradient", "sparse50"];
+    let patterns: &[&'static str] = &["opaque", "text-like"];
 
     // -----------------------------------------------------------------------
-    // Build all configurations upfront
+    // Build scenario-based configurations
     // -----------------------------------------------------------------------
     let mut configs: Vec<Config> = Vec::new();
     let mut order = 0usize;
 
-    for &size in sizes {
-        for &(rx, ry, _radius_label) in radii {
-            let iters = iterations_for_config(size, rx, ry);
-            for &op in &operators {
-                for &pattern in patterns {
-                    configs.push(Config {
-                        order,
-                        size,
-                        rx,
-                        ry,
-                        operator: op,
-                        pattern,
-                        iterations: iters,
-                    });
-                    order += 1;
-                }
+    // Helper: push configs for given scenario parameters across all patterns
+    let add = |scenario: &'static str,
+               width: u32,
+               height: u32,
+               rx: f32,
+               ry: f32,
+               operator: MorphologyOperator,
+               configs: &mut Vec<Config>,
+               order: &mut usize| {
+        let iters = iterations_for_config(width, height, rx, ry);
+        for &pattern in patterns {
+            configs.push(Config {
+                order: *order,
+                scenario,
+                width,
+                height,
+                rx,
+                ry,
+                operator,
+                pattern,
+                iterations: iters,
+            });
+            *order += 1;
+        }
+    };
+
+    // ------------------------------------------------------------------
+    // 1. Icon Text Outline: dilate r=2, icon sizes
+    //    Most common real-world use. radius=2 -> 4x4=16 kernel -> vHGW path
+    // ------------------------------------------------------------------
+    for &(w, h) in &[(16, 16), (20, 20), (24, 24), (48, 48), (96, 96)] {
+        add(
+            "Icon Text Outline",
+            w,
+            h,
+            2.0,
+            2.0,
+            MorphologyOperator::Dilate,
+            &mut configs,
+            &mut order,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Heading Outline: dilate r=3-4, medium/large text regions
+    //    radius=3 -> 6x6=36 kernel, radius=4 -> 8x8=64 kernel -> vHGW
+    // ------------------------------------------------------------------
+    for &(w, h) in &[(200, 150), (400, 300), (600, 400)] {
+        for &r in &[3.0, 4.0] {
+            add(
+                "Heading Outline",
+                w,
+                h,
+                r,
+                r,
+                MorphologyOperator::Dilate,
+                &mut configs,
+                &mut order,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Subtle Erode: erode r=1, various sizes
+    //    radius=1 -> 2x2=4 kernel -> always naive path (area < 9)
+    // ------------------------------------------------------------------
+    for &(w, h) in &[(16, 16), (24, 24), (48, 48), (96, 96), (200, 150), (400, 300)] {
+        add(
+            "Subtle Erode",
+            w,
+            h,
+            1.0,
+            1.0,
+            MorphologyOperator::Erode,
+            &mut configs,
+            &mut order,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Thick Knockout: dilate r=8, medium/large -- stress test for vHGW
+    //    radius=8 -> 16x16=256 kernel -> definitely vHGW
+    // ------------------------------------------------------------------
+    for &(w, h) in &[(96, 96), (200, 150), (400, 300)] {
+        add(
+            "Thick Knockout",
+            w,
+            h,
+            8.0,
+            8.0,
+            MorphologyOperator::Dilate,
+            &mut configs,
+            &mut order,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Threshold Boundary: radii near NAIVE_KERNEL_AREA_THRESHOLD=9
+    //    radius=1.0 -> 2x2=4 (naive), radius=1.5 -> 3x3=9 (boundary/naive),
+    //    radius=2.0 -> 4x4=16 (vHGW)
+    //    Test both operators at multiple sizes
+    // ------------------------------------------------------------------
+    for &(w, h) in &[(24, 24), (96, 96), (400, 300)] {
+        for &r in &[1.0, 1.5, 2.0] {
+            for &op in &[MorphologyOperator::Erode, MorphologyOperator::Dilate] {
+                add(
+                    "Threshold Boundary",
+                    w,
+                    h,
+                    r,
+                    r,
+                    op,
+                    &mut configs,
+                    &mut order,
+                );
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Non-square Images: real aspect ratios with common dilate r=2
+    //    Tests that vHGW handles non-square dimensions correctly
+    // ------------------------------------------------------------------
+    for &(w, h) in &[(200, 150), (400, 300), (600, 400)] {
+        add(
+            "Non-square",
+            w,
+            h,
+            2.0,
+            2.0,
+            MorphologyOperator::Dilate,
+            &mut configs,
+            &mut order,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Asymmetric Radius: directional effects (rx!=ry)
+    //    rx=1,ry=3 -> cols=2,rows=6 -> area=12 (vHGW)
+    //    rx=3,ry=1 -> cols=6,rows=2 -> area=12 (vHGW)
+    // ------------------------------------------------------------------
+    for &(w, h) in &[(96, 96), (400, 300)] {
+        for &(rx, ry) in &[(1.0, 3.0), (3.0, 1.0)] {
+            add(
+                "Asymmetric Radius",
+                w,
+                h,
+                rx,
+                ry,
+                MorphologyOperator::Dilate,
+                &mut configs,
+                &mut order,
+            );
         }
     }
 
@@ -286,24 +405,16 @@ fn main() {
         .unwrap_or(1);
 
     eprintln!(
-        "Running {} configurations ({} sizes x {} radii x {} operators x {} patterns)",
+        "Running {} configurations across 7 real-world scenarios",
         total_configs,
-        sizes.len(),
-        radii.len(),
-        operators.len(),
-        patterns.len()
     );
-    eprintln!(
-        "Using {} threads for parallel execution\n",
-        num_threads
-    );
+    eprintln!("Using {} threads for parallel execution\n", num_threads);
 
     // -----------------------------------------------------------------------
     // Execute benchmarks in parallel using std::thread::scope
     // -----------------------------------------------------------------------
     let progress = AtomicUsize::new(0);
 
-    // Split configs into chunks, one per thread
     let chunk_size = (configs.len() + num_threads - 1) / num_threads;
     let chunks: Vec<&[Config]> = configs.chunks(chunk_size).collect();
 
@@ -315,31 +426,17 @@ fn main() {
                 s.spawn(move || {
                     let mut results = Vec::with_capacity(chunk.len());
                     for cfg in chunk {
-                        let w = cfg.size;
-                        let h = cfg.size;
-
                         let base_data = match cfg.pattern {
-                            "opaque" => make_opaque(w, h, 42),
-                            "gradient" => make_gradient(w, h),
-                            "sparse50" => make_sparse50(w, h, 99),
+                            "opaque" => make_opaque(cfg.width, cfg.height, 42),
+                            "text-like" => make_text_like(cfg.width, cfg.height, 99),
                             _ => unreachable!(),
                         };
 
-                        let mut result = bench_one(
-                            w,
-                            h,
-                            cfg.rx,
-                            cfg.ry,
-                            cfg.operator,
-                            &base_data,
-                            cfg.pattern,
-                            cfg.iterations,
-                        );
-                        result.order = cfg.order;
+                        let result = bench_one(cfg, &base_data);
                         results.push(result);
 
                         let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done % 50 == 0 || done == total_configs {
+                        if done % 20 == 0 || done == total_configs {
                             eprintln!("  Progress: {}/{}", done, total_configs);
                         }
                     }
@@ -348,7 +445,6 @@ fn main() {
             })
             .collect();
 
-        // Collect results from all threads
         let mut merged = Vec::with_capacity(total_configs);
         for handle in handles {
             merged.extend(handle.join().unwrap());
@@ -363,14 +459,31 @@ fn main() {
     // Print results table
     // -----------------------------------------------------------------------
     println!(
-        "{:<12} | {:<28} | {:<8} | {:<10} | {:>6} | {:>10} | {:>10} | {:>8} | {:<10}",
-        "Image Size", "Radius", "Operator", "Pattern", "Path", "Naive (us)", "Prod (us)", "Speedup", "Status"
+        "{:<20} | {:<12} | {:<16} | {:<8} | {:<10} | {:>6} | {:>10} | {:>10} | {:>8} | {:<10}",
+        "Scenario",
+        "Size",
+        "Radius",
+        "Operator",
+        "Pattern",
+        "Path",
+        "Naive (us)",
+        "Prod (us)",
+        "Speedup",
+        "Status"
     );
-    println!("{}", "-".repeat(120));
+    println!("{}", "-".repeat(140));
 
+    let mut prev_scenario = "";
     for result in &all_results {
+        if result.scenario != prev_scenario {
+            if !prev_scenario.is_empty() {
+                println!("{}", "-".repeat(140));
+            }
+            prev_scenario = &result.scenario;
+        }
         println!(
-            "{:<12} | {:<28} | {:<8} | {:<10} | {:>6} | {:>10.2} | {:>10.2} | {:>7.2}x | {:<10}",
+            "{:<20} | {:<12} | {:<16} | {:<8} | {:<10} | {:>6} | {:>10.2} | {:>10.2} | {:>7.2}x | {:<10}",
+            result.scenario,
             result.image_size,
             result.radius,
             result.operator,
@@ -386,12 +499,14 @@ fn main() {
     // ---------------------------------------------------------------------------
     // Summary statistics
     // ---------------------------------------------------------------------------
-    println!("\n{}", "=".repeat(120));
+    println!("\n{}", "=".repeat(140));
     println!("SUMMARY");
-    println!("{}", "=".repeat(120));
+    println!("{}", "=".repeat(140));
 
-    // Count regressions
-    let regressions: Vec<&BenchResult> = all_results.iter().filter(|r| r.status == "REGRESSION").collect();
+    let regressions: Vec<&BenchResult> = all_results
+        .iter()
+        .filter(|r| r.status == "REGRESSION")
+        .collect();
     println!("\nTotal configurations: {}", all_results.len());
     println!("Regressions (<0.95x): {}", regressions.len());
     println!(
@@ -400,34 +515,59 @@ fn main() {
     );
     println!(
         "Faster (>1.05x): {}",
-        all_results.iter().filter(|r| r.status == "FASTER").count()
+        all_results
+            .iter()
+            .filter(|r| r.status == "FASTER")
+            .count()
     );
 
     if !regressions.is_empty() {
         println!("\n--- REGRESSIONS ---");
         for r in &regressions {
             println!(
-                "  {} {} {} {} | naive={:.2}us prod={:.2}us speedup={:.2}x (path={})",
-                r.image_size, r.radius, r.operator, r.input_pattern, r.naive_us, r.prod_us, r.speedup, r.path
+                "  [{}] {} {} {} {} | naive={:.2}us prod={:.2}us speedup={:.2}x (path={})",
+                r.scenario,
+                r.image_size,
+                r.radius,
+                r.operator,
+                r.input_pattern,
+                r.naive_us,
+                r.prod_us,
+                r.speedup,
+                r.path
             );
         }
     }
 
-    // Summary by image size
-    println!("\n--- BY IMAGE SIZE ---");
+    // Summary by scenario
+    println!("\n--- BY SCENARIO ---");
     println!(
-        "{:<12} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
-        "Size", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
+        "{:<20} | {:>6} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
+        "Scenario", "Count", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
     );
-    for &size in sizes {
-        let size_str = format!("{}x{}", size, size);
+    let scenario_names = [
+        "Icon Text Outline",
+        "Heading Outline",
+        "Subtle Erode",
+        "Thick Knockout",
+        "Threshold Boundary",
+        "Non-square",
+        "Asymmetric Radius",
+    ];
+    for scenario in &scenario_names {
         let subset: Vec<&BenchResult> = all_results
             .iter()
-            .filter(|r| r.image_size == size_str)
+            .filter(|r| r.scenario == *scenario)
             .collect();
+        if subset.is_empty() {
+            continue;
+        }
         let faster = subset.iter().filter(|r| r.status == "FASTER").count();
         let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
+        let regress = subset
+            .iter()
+            .filter(|r| r.status == "REGRESSION")
+            .count();
         let avg_speedup: f64 =
             subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
         let min_speedup: f64 = subset
@@ -435,79 +575,22 @@ fn main() {
             .map(|r| r.speedup)
             .fold(f64::INFINITY, f64::min);
         println!(
-            "{:<12} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
-            size_str, faster, same, regress, avg_speedup, min_speedup
+            "{:<20} | {:>6} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
+            scenario,
+            subset.len(),
+            faster,
+            same,
+            regress,
+            avg_speedup,
+            min_speedup
         );
     }
 
-    // Summary by radius
-    println!("\n--- BY RADIUS ---");
-    println!(
-        "{:<28} | {:>6} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
-        "Radius", "Path", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
-    );
-    for &(rx, ry, label) in radii {
-        let radius_str = format!("rx={:.1},ry={:.1}", rx, ry);
-        let subset: Vec<&BenchResult> = all_results
-            .iter()
-            .filter(|r| r.radius == radius_str)
-            .collect();
-        let path = if !subset.is_empty() {
-            // For the path, pick any non-tiny image (e.g., 64x64) to show expected path
-            subset
-                .iter()
-                .find(|r| r.image_size == "64x64")
-                .map(|r| r.path.as_str())
-                .unwrap_or(&subset[0].path)
-        } else {
-            "?"
-        };
-        let faster = subset.iter().filter(|r| r.status == "FASTER").count();
-        let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
-        let avg_speedup: f64 =
-            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len().max(1) as f64;
-        let min_speedup: f64 = subset
-            .iter()
-            .map(|r| r.speedup)
-            .fold(f64::INFINITY, f64::min);
-        println!(
-            "{:<28} | {:>6} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
-            label, path, faster, same, regress, avg_speedup, min_speedup
-        );
-    }
-
-    // Summary by operator
-    println!("\n--- BY OPERATOR ---");
-    println!(
-        "{:<8} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
-        "Operator", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
-    );
-    for op_name in &["Erode", "Dilate"] {
-        let subset: Vec<&BenchResult> = all_results
-            .iter()
-            .filter(|r| r.operator == *op_name)
-            .collect();
-        let faster = subset.iter().filter(|r| r.status == "FASTER").count();
-        let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
-        let avg_speedup: f64 =
-            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len().max(1) as f64;
-        let min_speedup: f64 = subset
-            .iter()
-            .map(|r| r.speedup)
-            .fold(f64::INFINITY, f64::min);
-        println!(
-            "{:<8} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
-            op_name, faster, same, regress, avg_speedup, min_speedup
-        );
-    }
-
-    // Summary by path (naive vs vhgw)
+    // Summary by dispatch path
     println!("\n--- BY DISPATCH PATH ---");
     println!(
-        "{:<8} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
-        "Path", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
+        "{:<8} | {:>6} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
+        "Path", "Count", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
     );
     for path_name in &["naive", "vhgw"] {
         let subset: Vec<&BenchResult> = all_results
@@ -519,7 +602,10 @@ fn main() {
         }
         let faster = subset.iter().filter(|r| r.status == "FASTER").count();
         let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
+        let regress = subset
+            .iter()
+            .filter(|r| r.status == "REGRESSION")
+            .count();
         let avg_speedup: f64 =
             subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
         let min_speedup: f64 = subset
@@ -527,36 +613,130 @@ fn main() {
             .map(|r| r.speedup)
             .fold(f64::INFINITY, f64::min);
         println!(
-            "{:<8} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
-            path_name, faster, same, regress, avg_speedup, min_speedup
+            "{:<8} | {:>6} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
+            path_name,
+            subset.len(),
+            faster,
+            same,
+            regress,
+            avg_speedup,
+            min_speedup
         );
     }
 
-    // Threshold analysis: look at the boundary cases
-    println!("\n--- THRESHOLD ANALYSIS (NAIVE_KERNEL_AREA_THRESHOLD = 9) ---");
-    println!("Comparing production (dispatched) vs always-naive at the boundary:");
+    // Summary by operator
+    println!("\n--- BY OPERATOR ---");
+    println!(
+        "{:<8} | {:>6} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
+        "Operator", "Count", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
+    );
+    for op_name in &["Erode", "Dilate"] {
+        let subset: Vec<&BenchResult> = all_results
+            .iter()
+            .filter(|r| r.operator == *op_name)
+            .collect();
+        if subset.is_empty() {
+            continue;
+        }
+        let faster = subset.iter().filter(|r| r.status == "FASTER").count();
+        let same = subset.iter().filter(|r| r.status == "SAME").count();
+        let regress = subset
+            .iter()
+            .filter(|r| r.status == "REGRESSION")
+            .count();
+        let avg_speedup: f64 =
+            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
+        let min_speedup: f64 = subset
+            .iter()
+            .map(|r| r.speedup)
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "{:<8} | {:>6} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
+            op_name,
+            subset.len(),
+            faster,
+            same,
+            regress,
+            avg_speedup,
+            min_speedup
+        );
+    }
+
+    // Summary by input pattern
+    println!("\n--- BY INPUT PATTERN ---");
+    println!(
+        "{:<10} | {:>6} | {:>8} | {:>8} | {:>8} | {:>12} | {:>12}",
+        "Pattern", "Count", "Faster", "Same", "Regress", "Avg Speedup", "Min Speedup"
+    );
+    for pat in patterns {
+        let subset: Vec<&BenchResult> = all_results
+            .iter()
+            .filter(|r| r.input_pattern == *pat)
+            .collect();
+        if subset.is_empty() {
+            continue;
+        }
+        let faster = subset.iter().filter(|r| r.status == "FASTER").count();
+        let same = subset.iter().filter(|r| r.status == "SAME").count();
+        let regress = subset
+            .iter()
+            .filter(|r| r.status == "REGRESSION")
+            .count();
+        let avg_speedup: f64 =
+            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
+        let min_speedup: f64 = subset
+            .iter()
+            .map(|r| r.speedup)
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "{:<10} | {:>6} | {:>8} | {:>8} | {:>8} | {:>11.2}x | {:>11.2}x",
+            pat,
+            subset.len(),
+            faster,
+            same,
+            regress,
+            avg_speedup,
+            min_speedup
+        );
+    }
+
+    // Threshold analysis
+    println!(
+        "\n--- THRESHOLD ANALYSIS (NAIVE_KERNEL_AREA_THRESHOLD = {}) ---",
+        NAIVE_KERNEL_AREA_THRESHOLD
+    );
+    println!("Production vs naive at the dispatch boundary (opaque pattern only):");
     let boundary_radii = [
-        ("rx=1.5,ry=1.5", "3x3=9, at threshold (naive)"),
-        ("rx=2.0,ry=2.0", "4x4=16, just above (vhgw)"),
+        ("rx=1.0,ry=1.0", "2x2=4, well below threshold (naive)"),
+        ("rx=1.5,ry=1.5", "3x3=9, at threshold boundary (naive)"),
+        ("rx=2.0,ry=2.0", "4x4=16, above threshold (vHGW)"),
     ];
     for (radius_str, desc) in &boundary_radii {
         println!("\n  {} ({})", radius_str, desc);
         let subset: Vec<&BenchResult> = all_results
             .iter()
-            .filter(|r| r.radius == *radius_str)
+            .filter(|r| {
+                r.radius == *radius_str
+                    && r.scenario == "Threshold Boundary"
+                    && r.input_pattern == "opaque"
+            })
             .collect();
         for r in &subset {
-            if r.input_pattern == "opaque" {
-                println!(
-                    "    {} {}: naive={:.2}us prod={:.2}us speedup={:.2}x ({})",
-                    r.image_size, r.operator, r.naive_us, r.prod_us, r.speedup, r.status
-                );
-            }
+            println!(
+                "    {} {}: naive={:.2}us prod={:.2}us speedup={:.2}x [{}] ({})",
+                r.image_size,
+                r.operator,
+                r.naive_us,
+                r.prod_us,
+                r.speedup,
+                r.path,
+                r.status
+            );
         }
     }
 
     // Overall verdict
-    println!("\n{}", "=".repeat(120));
+    println!("\n{}", "=".repeat(140));
     if regressions.is_empty() {
         println!("VERDICT: NO REGRESSIONS DETECTED");
     } else {
@@ -565,5 +745,5 @@ fn main() {
             regressions.len()
         );
     }
-    println!("{}", "=".repeat(120));
+    println!("{}", "=".repeat(140));
 }
