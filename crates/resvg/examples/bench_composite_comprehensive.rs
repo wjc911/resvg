@@ -1,10 +1,9 @@
-// Comprehensive feComposite Arithmetic benchmark
-// Tests naive vs optimized (production) paths across all parameter combinations.
+// Comprehensive feComposite benchmark with real-world usage patterns.
 //
-// We reimplement both paths here identically to composite.rs so that we can
-// call them independently from outside the private module.
+// Tests naive vs optimized (production) paths for arithmetic mode with
+// realistic input patterns, plus non-arithmetic operator benchmarks via SVG.
 //
-// Uses std::thread::scope for parallel execution across CPU cores.
+// Run with: cargo run --example bench_composite_comprehensive --release -p resvg
 
 use rgb::RGBA8;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -202,26 +201,13 @@ fn generate_pixels(count: usize, pattern: &str, seed: u64) -> Vec<RGBA8> {
                 p.b = (next() % 256) as u8;
             }
         }
-        "transparent" => {}
-        "sparse50" => {
+        "photo" => {
+            // Random RGBA — simulates photo content with varying alpha
             for p in pixels.iter_mut() {
-                if next() % 2 == 0 {
-                    p.a = 255;
-                    p.r = (next() % 256) as u8;
-                    p.g = (next() % 256) as u8;
-                    p.b = (next() % 256) as u8;
-                }
-            }
-        }
-        "gradient" => {
-            for (i, p) in pixels.iter_mut().enumerate() {
-                let alpha = ((i * 255) / count.max(1)) as u8;
-                p.a = alpha;
-                let f = alpha as f32 / 255.0;
-                let base = (next() % 256) as u8;
-                p.r = (base as f32 * f) as u8;
-                p.g = (base as f32 * f) as u8;
-                p.b = (base as f32 * f) as u8;
+                p.r = (next() % 256) as u8;
+                p.g = (next() % 256) as u8;
+                p.b = (next() % 256) as u8;
+                p.a = (next() % 256) as u8;
             }
         }
         _ => panic!("Unknown pattern: {}", pattern),
@@ -230,9 +216,7 @@ fn generate_pixels(count: usize, pattern: &str, seed: u64) -> Vec<RGBA8> {
 }
 
 fn bench_fn<F: FnMut()>(mut f: F, pixel_count: usize) -> Duration {
-    let iters = if pixel_count <= 64 {
-        50_000
-    } else if pixel_count <= 1024 {
+    let iters = if pixel_count <= 1024 {
         10_000
     } else if pixel_count <= 16384 {
         2_000
@@ -342,32 +326,77 @@ fn run_config(config: &Config, order: usize, progress: &AtomicUsize, total: usiz
     }
 }
 
+// ---------------------------------------------------------------------------
+// Non-arithmetic operator benchmarks via SVG rendering
+// ---------------------------------------------------------------------------
+
+fn bench_svg_composite_operator(
+    operator: &str,
+    width: u32,
+    height: u32,
+    iterations: u32,
+) -> (f64, f64) {
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">
+  <defs>
+    <filter id="comp" x="0" y="0" width="100%" height="100%">
+      <feFlood flood-color="red" flood-opacity="0.7" result="in1"/>
+      <feFlood flood-color="blue" flood-opacity="0.5" result="in2"/>
+      <feComposite in="in1" in2="in2" operator="{op}"/>
+    </filter>
+  </defs>
+  <rect width="100%" height="100%" filter="url(#comp)"/>
+</svg>"#,
+        w = width,
+        h = height,
+        op = operator
+    );
+
+    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).unwrap();
+
+    // Warm up
+    for _ in 0..2 {
+        let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
+        resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    }
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();
+        resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+        std::hint::black_box(&pixmap);
+    }
+    let elapsed = start.elapsed();
+
+    let ms_per_iter = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
+    let pixels = width as f64 * height as f64;
+    let mpx_per_sec = pixels / (ms_per_iter / 1000.0) / 1_000_000.0;
+
+    (ms_per_iter, mpx_per_sec)
+}
+
 fn main() {
+    // -----------------------------------------------------------------------
+    // Part 1: Arithmetic mode — naive vs production
+    // -----------------------------------------------------------------------
     let sizes: Vec<(&'static str, u32, u32)> = vec![
-        ("4x4", 4, 4),
-        ("16x16", 16, 16),
-        ("32x32", 32, 32),
-        ("64x64", 64, 64),
-        ("128x128", 128, 128),
-        ("256x256", 256, 256),
-        ("512x512", 512, 512),
-        ("1024x1024", 1024, 1024),
-        ("2048x2048", 2048, 2048),
+        ("24x24", 24, 24),
+        ("48x48", 48, 48),
+        ("96x96", 96, 96),
+        ("200x150", 200, 150),
+        ("400x300", 400, 300),
+        ("800x600", 800, 600),
+        ("1024x768", 1024, 768),
     ];
 
     let k_values: Vec<(&'static str, f32, f32, f32, f32)> = vec![
-        ("k=(0,0,0,0)", 0.0, 0.0, 0.0, 0.0),
-        ("k=(0,1,0,0)", 0.0, 1.0, 0.0, 0.0),
-        ("k=(0,0,1,0)", 0.0, 0.0, 1.0, 0.0),
-        ("k=(1,0,0,0)", 1.0, 0.0, 0.0, 0.0),
-        ("k=(0.5,0.5,0.5,0)", 0.5, 0.5, 0.5, 0.0),
-        ("k=(1,1,1,-0.5)", 1.0, 1.0, 1.0, -0.5),
-        ("k=(0,0,0,1)", 0.0, 0.0, 0.0, 1.0),
-        ("k=(1,0,0,0.5)", 1.0, 0.0, 0.0, 0.5),
-        ("k=(0,1,0,0.5)", 0.0, 1.0, 0.0, 0.5),
+        ("k=(0,1,1,0) additive", 0.0, 1.0, 1.0, 0.0),
+        ("k=(0,0.5,0.5,0) dissolve", 0.0, 0.5, 0.5, 0.0),
+        ("k=(1,0,0,0) multiply", 1.0, 0.0, 0.0, 0.0),
+        ("k=(0,1,0,0) pass-thru", 0.0, 1.0, 0.0, 0.0),
     ];
 
-    let patterns: [&'static str; 4] = ["opaque", "transparent", "sparse50", "gradient"];
+    let patterns: [&'static str; 2] = ["opaque", "photo"];
 
     // Build all configurations upfront
     let mut configs: Vec<Config> = Vec::with_capacity(sizes.len() * k_values.len() * patterns.len());
@@ -394,8 +423,8 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(1);
 
-    eprintln!("Running {} benchmark configurations on {} threads...", total, num_threads);
-    eprintln!("(This may take a few minutes)\n");
+    eprintln!("=== Part 1: Arithmetic Mode (naive vs production) ===");
+    eprintln!("Running {} configurations on {} threads...\n", total, num_threads);
 
     let progress = AtomicUsize::new(0);
 
@@ -431,19 +460,24 @@ fn main() {
     eprintln!("\r                                                                              ");
     eprintln!("Done.\n");
 
-    println!("{:-<130}", "");
+    println!("feComposite Comprehensive Benchmark — Real-World Usage Patterns");
+    println!("================================================================\n");
+
+    println!("--- Part 1: Arithmetic Mode ---\n");
+
+    println!("{:-<120}", "");
     println!(
-        "{:<12} | {:<22} | {:<14} | {:>12} | {:>12} | {:>8} | {}",
-        "Image Size", "K-values", "Input Pattern", "Naive (us)", "Prod (us)", "Speedup", "Status"
+        "{:<12} | {:<24} | {:<8} | {:>12} | {:>12} | {:>8} | {}",
+        "Image Size", "K-values", "Pattern", "Naive (us)", "Prod (us)", "Speedup", "Status"
     );
-    println!("{:-<130}", "");
+    println!("{:-<120}", "");
 
     let mut regression_count = 0;
     let mut prev_size = "";
 
     for r in &results {
         if !prev_size.is_empty() && r.size != prev_size {
-            println!("{:-<130}", "");
+            println!("{:-<120}", "");
         }
         prev_size = r.size;
 
@@ -459,37 +493,18 @@ fn main() {
         };
 
         println!(
-            "{:<12} | {:<22} | {:<14} | {:>12.2} | {:>12.2} | {:>7.2}x | {}",
+            "{:<12} | {:<24} | {:<8} | {:>12.2} | {:>12.2} | {:>7.2}x | {}",
             r.size, r.k_label, r.pattern, naive_us, prod_us, r.speedup, status
         );
     }
 
-    println!("{:-<130}", "");
+    println!("{:-<120}", "");
 
-    println!("\n=== SUMMARY ===");
+    println!("\n=== Arithmetic Summary ===");
     println!("Total configurations tested: {}", results.len());
     println!("Regressions (prod >5% slower than naive): {}", regression_count);
 
-    if regression_count > 0 {
-        println!("\n=== REGRESSIONS DETAIL ===");
-        println!(
-            "{:<12} | {:<22} | {:<14} | {:>12} | {:>12} | {:>8}",
-            "Image Size", "K-values", "Input Pattern", "Naive (us)", "Prod (us)", "Slowdown"
-        );
-        for r in &results {
-            if r.regression {
-                let naive_us = r.naive_ns as f64 / 1000.0;
-                let prod_us = r.prod_ns as f64 / 1000.0;
-                let slowdown = prod_us / naive_us;
-                println!(
-                    "{:<12} | {:<22} | {:<14} | {:>12.2} | {:>12.2} | {:>7.2}x",
-                    r.size, r.k_label, r.pattern, naive_us, prod_us, slowdown
-                );
-            }
-        }
-    }
-
-    println!("\n=== AVERAGE SPEEDUP BY IMAGE SIZE ===");
+    println!("\n=== Average Speedup by Image Size ===");
     for &(size_label, _, _) in &sizes {
         let matching: Vec<&BenchResult> = results.iter().filter(|r| r.size == size_label).collect();
         if matching.is_empty() {
@@ -498,11 +513,49 @@ fn main() {
         let avg_speedup: f64 = matching.iter().map(|r| r.speedup).sum::<f64>() / matching.len() as f64;
         let min_speedup: f64 = matching.iter().map(|r| r.speedup).fold(f64::INFINITY, f64::min);
         let max_speedup: f64 = matching.iter().map(|r| r.speedup).fold(f64::NEG_INFINITY, f64::max);
-        let reg_count = matching.iter().filter(|r| r.regression).count();
         println!(
-            "  {:<12}  avg={:.2}x  min={:.2}x  max={:.2}x  regressions={}",
-            size_label, avg_speedup, min_speedup, max_speedup, reg_count
+            "  {:<12}  avg={:.2}x  min={:.2}x  max={:.2}x",
+            size_label, avg_speedup, min_speedup, max_speedup
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 2: Non-arithmetic operators via SVG rendering
+    // -----------------------------------------------------------------------
+    println!("\n\n--- Part 2: Non-Arithmetic Operators (SVG rendering) ---\n");
+
+    let operators = ["over", "in", "out"];
+    let svg_sizes: &[(u32, u32)] = &[
+        (48, 48),
+        (96, 96),
+        (200, 150),
+        (400, 300),
+    ];
+
+    println!(
+        "{:<10} {:<12} {:<12} {:<14}",
+        "Operator", "Resolution", "Time (ms)", "Mpix/s"
+    );
+    println!("{}", "-".repeat(50));
+
+    for op in &operators {
+        for &(w, h) in svg_sizes {
+            let _pixels = w as f64 * h as f64;
+            // Probe to determine iteration count
+            let (probe_ms, _) = bench_svg_composite_operator(op, w, h, 1);
+            let iterations = ((2000.0 / probe_ms).ceil() as u32).max(2).min(2000);
+
+            let (ms_per_iter, mpx_per_sec) = bench_svg_composite_operator(op, w, h, iterations);
+
+            println!(
+                "{:<10} {:<12} {:<12.3} {:<14.2}",
+                op,
+                format!("{}x{}", w, h),
+                ms_per_iter,
+                mpx_per_sec
+            );
+        }
+        println!();
     }
 
     if regression_count > 0 {

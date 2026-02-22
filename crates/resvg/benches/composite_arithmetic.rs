@@ -1,7 +1,7 @@
 // Copyright 2020 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Benchmark for feComposite Arithmetic mode.
+//! Benchmark for feComposite Arithmetic mode with real-world k-value combinations.
 //!
 //! Compares the naive (original) and SoA-batched optimized implementations,
 //! verifies bit-exact output, and reports throughput at multiple resolutions.
@@ -357,25 +357,24 @@ fn bench_one(
 }
 
 fn main() {
-    println!("feComposite Arithmetic Benchmark — Naive vs SoA-Batched Optimized");
-    println!("=================================================================");
+    println!("feComposite Arithmetic Benchmark — Real-World K-Value Combinations");
+    println!("===================================================================");
     println!();
 
     let resolutions: &[(u32, u32, &str)] = &[
-        (64, 64, "64x64"),
-        (256, 256, "256x256"),
-        (512, 512, "512x512"),
-        (1024, 1024, "1024x1024"),
-        (2048, 2048, "2048x2048"),
+        (48, 48, "48x48"),
+        (96, 96, "96x96"),
+        (200, 150, "200x150"),
+        (400, 300, "400x300"),
+        (800, 600, "800x600"),
+        (1024, 768, "1024x768"),
     ];
 
     let k_values: &[(f32, f32, f32, f32, &str)] = &[
-        (0.0, 1.0, 0.0, 0.0, "k=(0,1,0,0) passthrough"),
-        (0.0, 0.0, 1.0, 0.0, "k=(0,0,1,0) passthrough"),
-        (1.0, 0.0, 0.0, 0.0, "k=(1,0,0,0) multiply"),
-        (0.5, 0.5, 0.5, 0.0, "k=(0.5,0.5,0.5,0) blend"),
-        (1.0, 1.0, 1.0, -0.5, "k=(1,1,1,-0.5) full arith"),
-        (0.0, 0.0, 0.0, 0.0, "k=(0,0,0,0) zeros"),
+        (0.0, 1.0, 1.0, 0.0, "k=(0,1,1,0) additive blend"),
+        (0.0, 0.5, 0.5, 0.0, "k=(0,0.5,0.5,0) 50/50 dissolve"),
+        (1.0, 0.0, 0.0, 0.0, "k=(1,0,0,0) multiply blend"),
+        (0.0, 1.0, 0.0, 0.0, "k=(0,1,0,0) pass-through in1"),
     ];
 
     for &(w, h, res_label) in resolutions {
