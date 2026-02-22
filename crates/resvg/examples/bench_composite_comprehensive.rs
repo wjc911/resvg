@@ -1,3 +1,6 @@
+// Copyright 2024 the Resvg Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
 // Comprehensive feComposite benchmark with real-world usage patterns.
 //
 // Tests naive vs optimized (production) paths for arithmetic mode with
