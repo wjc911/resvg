@@ -1,3 +1,6 @@
+// Copyright 2024 the Resvg Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
 // Comprehensive performance benchmark for feMorphology filter optimization.
 //
 // Scenarios modelled after real-world SVG morphology usage:
