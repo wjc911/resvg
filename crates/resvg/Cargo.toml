@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "composite_arithmetic"
 harness = false
+
+[[bench]]
+name = "specular_lighting_bench"
+harness = false

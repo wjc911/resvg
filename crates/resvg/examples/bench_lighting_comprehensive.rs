@@ -6,12 +6,8 @@
 //! Tests multiple image sizes, light source types, parameter combinations,
 //! and input patterns to detect performance regressions.
 //!
-//! Uses multithreading via `std::thread::scope` for faster execution across
-//! available CPU cores.
-//!
 //! Usage: cargo run --release --example bench_lighting_comprehensive [diffuse|specular|both]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Input pattern types for benchmark diversity.
@@ -138,7 +134,6 @@ fn pick_iterations(w: u32, h: u32) -> u32 {
 }
 
 struct BenchResult {
-    order: usize,
     filter_type: String,
     size: String,
     light_name: String,
@@ -149,14 +144,7 @@ struct BenchResult {
     iterations: u32,
 }
 
-/// A self-contained configuration tuple for one benchmark run, including its
-/// original index so results can be sorted back into order after parallel execution.
-struct IndexedConfig {
-    order: usize,
-    config: BenchConfig,
-}
-
-fn run_bench(config: &BenchConfig, order: usize) -> BenchResult {
+fn run_bench(config: &BenchConfig) -> BenchResult {
     let svg = generate_svg(config);
     let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).unwrap();
     let mut pixmap = tiny_skia::Pixmap::new(config.width, config.height).unwrap();
@@ -195,7 +183,6 @@ fn run_bench(config: &BenchConfig, order: usize) -> BenchResult {
     let mpix_per_s = pixels / best_time_us; // us -> s would multiply by 1e6, but Mpix divides by 1e6
 
     BenchResult {
-        order,
         filter_type: config.filter_type.to_string(),
         size: format!("{}x{}", config.width, config.height),
         light_name: config.light_name.to_string(),
@@ -205,73 +192,6 @@ fn run_bench(config: &BenchConfig, order: usize) -> BenchResult {
         mpix_per_s,
         iterations,
     }
-}
-
-/// Run benchmarks in parallel using `std::thread::scope`, splitting work across
-/// available CPU cores.  An `AtomicUsize` progress counter lets every thread
-/// report completions without a mutex.
-fn run_benchmarks_parallel(configs: Vec<BenchConfig>) -> Vec<BenchResult> {
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-
-    let total = configs.len();
-    eprintln!("  Using {} threads for {} configurations", num_threads, total);
-
-    // Wrap each config with its original index.
-    let indexed: Vec<IndexedConfig> = configs
-        .into_iter()
-        .enumerate()
-        .map(|(i, config)| IndexedConfig { order: i, config })
-        .collect();
-
-    // Split into roughly equal chunks, one per thread.
-    let chunks: Vec<&[IndexedConfig]> = {
-        let chunk_size = (indexed.len() + num_threads - 1) / num_threads;
-        indexed.chunks(chunk_size).collect()
-    };
-
-    let progress = AtomicUsize::new(0);
-
-    let mut all_results: Vec<BenchResult> = std::thread::scope(|s| {
-        let handles: Vec<_> = chunks
-            .into_iter()
-            .map(|chunk| {
-                let progress_ref = &progress;
-                s.spawn(move || {
-                    let mut thread_results = Vec::with_capacity(chunk.len());
-                    for item in chunk {
-                        let result = run_bench(&item.config, item.order);
-                        thread_results.push(result);
-
-                        let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done % 10 == 0 || done == total {
-                            eprint!(
-                                "\r  Progress: {}/{} ({:.0}%)",
-                                done,
-                                total,
-                                done as f64 / total as f64 * 100.0
-                            );
-                        }
-                    }
-                    thread_results
-                })
-            })
-            .collect();
-
-        // Collect results from all threads.
-        let mut merged = Vec::with_capacity(total);
-        for handle in handles {
-            merged.extend(handle.join().unwrap());
-        }
-        merged
-    });
-
-    eprintln!();
-
-    // Sort back into original configuration order.
-    all_results.sort_by_key(|r| r.order);
-    all_results
 }
 
 fn diffuse_configs() -> Vec<BenchConfig> {
@@ -513,10 +433,8 @@ fn run_threshold_test() {
     );
     println!("{}", "-".repeat(100));
 
-    // Build configs for parallel execution of threshold test.
-    let configs: Vec<BenchConfig> = threshold_sizes
-        .iter()
-        .map(|&(w, h, _)| BenchConfig {
+    for &(w, h, category) in &threshold_sizes {
+        let config = BenchConfig {
             filter_type: "feDiffuseLighting",
             width: w,
             height: h,
@@ -525,12 +443,9 @@ fn run_threshold_test() {
             params_desc: "dc=1,ss=5".to_string(),
             filter_attrs: r#"surfaceScale="5" diffuseConstant="1""#.to_string(),
             pattern: InputPattern::Gradient,
-        })
-        .collect();
+        };
 
-    let results = run_benchmarks_parallel(configs);
-
-    for (result, &(w, h, category)) in results.iter().zip(threshold_sizes.iter()) {
+        let result = run_bench(&config);
         let path = if (w * h) < 128 * 128 { "NAIVE" } else { "OPTIMIZED" };
 
         println!(
@@ -611,13 +526,8 @@ fn main() {
     let run_diffuse = mode == "diffuse" || mode == "both";
     let run_specular = mode == "specular" || mode == "both";
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-
     println!("Comprehensive Lighting Filter Benchmark");
     println!("Mode: {}", mode);
-    println!("Threads: {}", num_threads);
     println!("Timestamp: {:?}", std::time::SystemTime::now());
     println!();
 
@@ -626,7 +536,20 @@ fn main() {
         let configs = diffuse_configs();
         println!("Running {} feDiffuseLighting benchmarks...", configs.len());
 
-        let results = run_benchmarks_parallel(configs);
+        let mut results = Vec::new();
+        let total = configs.len();
+        for (i, config) in configs.iter().enumerate() {
+            if (i + 1) % 10 == 0 || i + 1 == total {
+                eprint!(
+                    "\r  Progress: {}/{} ({:.0}%)",
+                    i + 1,
+                    total,
+                    (i + 1) as f64 / total as f64 * 100.0
+                );
+            }
+            results.push(run_bench(config));
+        }
+        eprintln!();
 
         print_results_table("feDiffuseLighting", &results);
         print_summary_table("feDiffuseLighting", &results);
@@ -639,7 +562,20 @@ fn main() {
         let configs = specular_configs();
         println!("Running {} feSpecularLighting benchmarks...", configs.len());
 
-        let results = run_benchmarks_parallel(configs);
+        let mut results = Vec::new();
+        let total = configs.len();
+        for (i, config) in configs.iter().enumerate() {
+            if (i + 1) % 10 == 0 || i + 1 == total {
+                eprint!(
+                    "\r  Progress: {}/{} ({:.0}%)",
+                    i + 1,
+                    total,
+                    (i + 1) as f64 / total as f64 * 100.0
+                );
+            }
+            results.push(run_bench(config));
+        }
+        eprintln!();
 
         print_results_table("feSpecularLighting", &results);
         print_summary_table("feSpecularLighting", &results);
