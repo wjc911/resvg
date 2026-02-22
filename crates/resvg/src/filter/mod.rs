@@ -237,6 +237,11 @@ fn from_linear_rgb(data: &mut [RGBA8]) {
     }
 }
 
+// Manual clamping instead of f32::clamp to avoid NaN-propagation overhead.
+// f32::clamp propagates NaN (returns NaN when val is NaN), which inhibits
+// LLVM auto-vectorization of hot pixel loops. Our inputs are guaranteed
+// finite by the debug_asserts below, so the simpler branch version lets
+// LLVM emit tighter SIMD code.
 #[inline]
 fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
     debug_assert!(min.is_finite());
