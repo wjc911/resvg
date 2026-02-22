@@ -29,7 +29,14 @@ const SCENARIOS: &[Scenario] = &[
         kernel: &[0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0],
         order: 3,
         divisor: 1.0,
-        sizes: &[(200, 150), (400, 300), (600, 400), (800, 600), (1024, 768), (1500, 1000)],
+        sizes: &[
+            (200, 150),
+            (400, 300),
+            (600, 400),
+            (800, 600),
+            (1024, 768),
+            (1500, 1000),
+        ],
     },
     Scenario {
         name: "Emboss 3x3",
@@ -50,16 +57,19 @@ const SCENARIOS: &[Scenario] = &[
         kernel: &[1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0],
         order: 3,
         divisor: 16.0,
-        sizes: &[(400, 300), (600, 400), (800, 600), (1024, 768), (1500, 1000)],
+        sizes: &[
+            (400, 300),
+            (600, 400),
+            (800, 600),
+            (1024, 768),
+            (1500, 1000),
+        ],
     },
     Scenario {
         name: "Unsharp 5x5",
         kernel: &[
-            1.0,  4.0,    6.0,  4.0, 1.0,
-            4.0, 16.0,   24.0, 16.0, 4.0,
-            6.0, 24.0, -476.0, 24.0, 6.0,
-            4.0, 16.0,   24.0, 16.0, 4.0,
-            1.0,  4.0,    6.0,  4.0, 1.0,
+            1.0, 4.0, 6.0, 4.0, 1.0, 4.0, 16.0, 24.0, 16.0, 4.0, 6.0, 24.0, -476.0, 24.0, 6.0, 4.0,
+            16.0, 24.0, 16.0, 4.0, 1.0, 4.0, 6.0, 4.0, 1.0,
         ],
         order: 5,
         divisor: -256.0,
@@ -88,17 +98,29 @@ fn main() {
             let mut pixmap = tiny_skia::Pixmap::new(w, h).unwrap();
 
             // Warmup
-            resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+            resvg::render(
+                &tree,
+                tiny_skia::Transform::identity(),
+                &mut pixmap.as_mut(),
+            );
 
             // Calibrate: run a few iterations to estimate cost, then pick count
             let iterations = calibrate(|| {
-                resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+                resvg::render(
+                    &tree,
+                    tiny_skia::Transform::identity(),
+                    &mut pixmap.as_mut(),
+                );
             });
 
             // Timed run
             let start = Instant::now();
             for _ in 0..iterations {
-                resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+                resvg::render(
+                    &tree,
+                    tiny_skia::Transform::identity(),
+                    &mut pixmap.as_mut(),
+                );
             }
             let elapsed = start.elapsed();
 
@@ -107,10 +129,7 @@ fn main() {
 
             println!(
                 "{:<22} {:>5}x{:<5} {:>10.3} {:>10.2}",
-                scenario.name,
-                w, h,
-                ms,
-                mpix,
+                scenario.name, w, h, ms, mpix,
             );
         }
         println!();
