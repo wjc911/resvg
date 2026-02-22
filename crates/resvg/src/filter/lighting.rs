@@ -187,7 +187,9 @@ pub fn specular_lighting(
     specular_lighting_optimized(fe, light_source, src, dest);
 }
 
-/// The original (naive) specular lighting implementation, preserved verbatim.
+/// Original specular lighting implementation using the generic `apply()` path.
+/// Retained under `#[cfg(test)]` as the correctness reference for bit-exact
+/// comparison against the optimized version.
 #[cfg(test)]
 fn specular_lighting_naive(
     fe: &SpecularLighting,
