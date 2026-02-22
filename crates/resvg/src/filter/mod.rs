@@ -11,7 +11,8 @@ mod box_blur;
 mod color_matrix;
 mod component_transfer;
 mod composite;
-mod convolve_matrix;
+#[doc(hidden)]
+pub mod convolve_matrix;
 mod displacement_map;
 mod iir_blur;
 mod lighting;
