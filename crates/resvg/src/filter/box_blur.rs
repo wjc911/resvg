@@ -35,9 +35,12 @@ pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
 
     // For large images with significant vertical blur radius, use a tiled
     // implementation that processes columns in cache-friendly tiles.
-    // The threshold of 250k pixels and radius >= 8 was determined empirically:
+    // The threshold of 1M pixels and radius >= 8 was determined empirically:
     // below these values the overhead of tiling outweighs the cache benefit.
-    if pixel_count > 250_000 && max_radius_vert >= 8 {
+    // Benchmarks show the tiled path yields consistent speedups for images
+    // up to ~500k pixels, but regresses for ~786k pixels (e.g. 1024x768).
+    // Setting the threshold to 1M ensures only very large images use tiling.
+    if pixel_count > 1_000_000 && max_radius_vert >= 8 {
         apply_tiled(&boxes_horz, &boxes_vert, &mut backbuf, &mut src);
         return;
     }

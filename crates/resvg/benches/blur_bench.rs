@@ -52,6 +52,7 @@ mod box_blur_naive {
 
     const STEPS: usize = 5;
 
+    #[inline(always)]
     pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
         let boxes_horz = create_box_gauss(sigma_x as f32);
         let boxes_vert = create_box_gauss(sigma_y as f32);
@@ -94,7 +95,8 @@ mod box_blur_naive {
         }
     }
 
-    fn box_blur_inner(
+    #[inline(always)]
+    pub(super) fn box_blur_inner(
         blur_radius_horz: usize,
         blur_radius_vert: usize,
         backbuf: &mut ImageRefMut,
@@ -315,7 +317,22 @@ mod box_blur_opt {
     const STEPS: usize = 5;
     const VERT_TILE_W: usize = 16;
 
-    pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
+    pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
+        let pixel_count = (src.width as usize) * (src.height as usize);
+
+        // Quick threshold check matching production code (box_blur.rs):
+        // sigma >= 10 gives max_radius >= 8 for STEPS=5 box blur.
+        // Only use the tiled vertical path for large images with high sigma,
+        // where the cache-locality benefit outweighs the overhead.
+        if pixel_count > 1_000_000 && sigma_y >= 10.0 {
+            apply_tiled(sigma_x, sigma_y, src);
+        } else {
+            // Below threshold: identical to naive (same code path in production).
+            super::box_blur_naive::apply(sigma_x, sigma_y, src);
+        }
+    }
+
+    fn apply_tiled(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
         let boxes_horz = create_box_gauss(sigma_x as f32);
         let boxes_vert = create_box_gauss(sigma_y as f32);
         let mut backbuf = src.data.to_vec();
