@@ -908,15 +908,9 @@ fn main() {
     // -----------------------------------------------------------------
     println!("--- Box blur: icon shadows (Material Z1-Z4) ---\n");
 
-    let icon_sizes: &[(u32, u32, &str)] = &[
-        (24, 24, "icon"),
-        (48, 48, "large icon"),
-        (96, 96, "avatar"),
-    ];
-    let icon_sigmas: &[(f64, &str)] = &[
-        (2.0, "Material Z1-Z2"),
-        (4.0, "MDN canonical shadow"),
-    ];
+    let icon_sizes: &[(u32, u32, &str)] =
+        &[(24, 24, "icon"), (48, 48, "large icon"), (96, 96, "avatar")];
+    let icon_sigmas: &[(f64, &str)] = &[(2.0, "Material Z1-Z2"), (4.0, "MDN canonical shadow")];
 
     for &(w, h, size_label) in icon_sizes {
         for &(sigma, sigma_label) in icon_sigmas {
@@ -945,10 +939,7 @@ fn main() {
         (400, 300, "card"),
         (800, 600, "tablet"),
     ];
-    let card_sigmas: &[(f64, &str)] = &[
-        (4.0, "standard shadow"),
-        (8.0, "backdrop-blur default"),
-    ];
+    let card_sigmas: &[(f64, &str)] = &[(4.0, "standard shadow"), (8.0, "backdrop-blur default")];
 
     for &(w, h, size_label) in card_sizes {
         for &(sigma, sigma_label) in card_sigmas {
@@ -977,10 +968,8 @@ fn main() {
         (1024, 768, "laptop"),
         (1500, 1000, "desktop"),
     ];
-    let backdrop_sigmas: &[(f64, &str)] = &[
-        (16.0, "Apple frosted glass"),
-        (40.0, "backdrop-blur-2xl"),
-    ];
+    let backdrop_sigmas: &[(f64, &str)] =
+        &[(16.0, "Apple frosted glass"), (40.0, "backdrop-blur-2xl")];
 
     for &(w, h, size_label) in backdrop_sizes {
         for &(sigma, sigma_label) in backdrop_sigmas {
@@ -1004,10 +993,7 @@ fn main() {
     // -----------------------------------------------------------------
     println!("--- IIR interleaved: large image + small sigma ---\n");
 
-    let iir_large_configs: &[(u32, u32, &str)] = &[
-        (1024, 768, "laptop"),
-        (1500, 1000, "desktop"),
-    ];
+    let iir_large_configs: &[(u32, u32, &str)] = &[(1024, 768, "laptop"), (1500, 1000, "desktop")];
 
     for &(w, h, label) in iir_large_configs {
         let iters = choose_iters(w, h);
@@ -1035,11 +1021,19 @@ fn main() {
         let sigma = 8.0;
         let tag_naive = format!(
             "box {}x{} ({}px, {}) sigma={} naive",
-            w, h, w as u64 * h as u64, label, sigma
+            w,
+            h,
+            w as u64 * h as u64,
+            label,
+            sigma
         );
         let tag_opt = format!(
             "box {}x{} ({}px, {}) sigma={} optimized",
-            w, h, w as u64 * h as u64, label, sigma
+            w,
+            h,
+            w as u64 * h as u64,
+            label,
+            sigma
         );
         let t_naive = bench_one(&tag_naive, w, h, sigma, &box_blur_naive::apply, iters);
         let t_opt = bench_one(&tag_opt, w, h, sigma, &box_blur_opt::apply, iters);
@@ -1049,21 +1043,27 @@ fn main() {
     println!("--- Threshold boundary: 500k pixel IIR interleaved boundary ---");
     println!("  Tests: 707x707=499849, 708x707=500556\n");
 
-    let iir_boundary_sizes: &[(u32, u32, &str)] = &[
-        (707, 707, "just below 500k"),
-        (708, 707, "just above 500k"),
-    ];
+    let iir_boundary_sizes: &[(u32, u32, &str)] =
+        &[(707, 707, "just below 500k"), (708, 707, "just above 500k")];
 
     for &(w, h, label) in iir_boundary_sizes {
         let iters = choose_iters(w, h);
         let sigma = 1.5;
         let tag_naive = format!(
             "IIR {}x{} ({}px, {}) sigma={} naive",
-            w, h, w as u64 * h as u64, label, sigma
+            w,
+            h,
+            w as u64 * h as u64,
+            label,
+            sigma
         );
         let tag_opt = format!(
             "IIR {}x{} ({}px, {}) sigma={} optimized",
-            w, h, w as u64 * h as u64, label, sigma
+            w,
+            h,
+            w as u64 * h as u64,
+            label,
+            sigma
         );
         let t_naive = bench_one(&tag_naive, w, h, sigma, &iir_blur_naive::apply, iters);
         let t_opt = bench_one(&tag_opt, w, h, sigma, &iir_blur_opt::apply, iters);

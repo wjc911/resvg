@@ -26,10 +26,7 @@ fn main() {
 
     // PointLight listed first as it is the most common light source
     let light_types: &[(&str, &str)] = &[
-        (
-            "point",
-            r#"<fePointLight x="50" y="100" z="200"/>"#,
-        ),
+        ("point", r#"<fePointLight x="50" y="100" z="200"/>"#),
         (
             "distant",
             r#"<feDistantLight azimuth="45" elevation="55"/>"#,

@@ -836,13 +836,21 @@ fn make_photo(width: u32, height: u32) -> Vec<RGBA8> {
     // Simple LCG for deterministic "random" data simulating photographic content
     let mut rng: u64 = 0xDEADBEEF;
     for _ in 0..n {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let r = (rng >> 56) as u8;
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let g = (rng >> 56) as u8;
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let b = (rng >> 56) as u8;
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let a = (rng >> 56) as u8;
         data.push(RGBA8 { r, g, b, a });
     }
@@ -1005,7 +1013,10 @@ fn run_config(config: &Config, progress: &AtomicUsize, total: usize) -> BenchRes
     };
 
     let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-    eprint!("\r  Progress: {}/{} configurations completed...", done, total);
+    eprint!(
+        "\r  Progress: {}/{} configurations completed...",
+        done, total
+    );
 
     BenchResult {
         order: config.order,
@@ -1289,10 +1300,7 @@ fn main() {
         (707, 707, "499849px, below 500k"),
         (708, 707, "500556px, above 500k"),
     ];
-    let iir_boundary_sigmas: &[(f64, &str)] = &[
-        (1.0, "fine detail"),
-        (1.5, "subtle glow"),
-    ];
+    let iir_boundary_sigmas: &[(f64, &str)] = &[(1.0, "fine detail"), (1.5, "subtle glow")];
 
     for &(w, h, size_label) in iir_boundary_sizes {
         for &(sigma, sigma_label) in iir_boundary_sigmas {
@@ -1318,11 +1326,8 @@ fn main() {
     // Scenario 5: Asymmetric Blur (sigma_x != sigma_y)
     // Directional shadows, motion-like blur effects
     // -----------------------------------------------------------------
-    let asym_sizes: &[(u32, u32, &str)] = &[
-        (96, 96, "avatar"),
-        (400, 300, "card"),
-        (800, 600, "tablet"),
-    ];
+    let asym_sizes: &[(u32, u32, &str)] =
+        &[(96, 96, "avatar"), (400, 300, "card"), (800, 600, "tablet")];
     let asym_sigmas: &[(f64, f64, &str)] = &[
         (4.0, 0.0, "horizontal-only shadow"),
         (0.0, 4.0, "vertical-only shadow"),
@@ -1409,8 +1414,7 @@ fn main() {
         println!("\n--- {} ---", section.name());
         println!(
             "{:<12} {:<12} {:<8} {:<10} {:<28} {:>12} {:>12} {:>10}",
-            "Size", "Sigma", "Input", "Algorithm", "Use Case",
-            "Naive (us)", "Opt (us)", "Speedup"
+            "Size", "Sigma", "Input", "Algorithm", "Use Case", "Naive (us)", "Opt (us)", "Speedup"
         );
         println!("{}", "-".repeat(112));
 
@@ -1439,10 +1443,7 @@ fn main() {
     // =====================================================================
     println!("\n=== Regression Summary ===\n");
 
-    let regressions: Vec<&BenchResult> = all_results
-        .iter()
-        .filter(|r| r.speedup < 0.95)
-        .collect();
+    let regressions: Vec<&BenchResult> = all_results.iter().filter(|r| r.speedup < 0.95).collect();
 
     if regressions.is_empty() {
         println!("No regressions detected (all speedups >= 0.95x).");
@@ -1453,8 +1454,7 @@ fn main() {
         );
         println!(
             "{:<12} {:<12} {:<8} {:<10} {:<28} {:>12} {:>12} {:>10}",
-            "Size", "Sigma", "Input", "Algorithm", "Use Case",
-            "Naive (us)", "Opt (us)", "Speedup"
+            "Size", "Sigma", "Input", "Algorithm", "Use Case", "Naive (us)", "Opt (us)", "Speedup"
         );
         println!("{}", "-".repeat(112));
         for r in &regressions {

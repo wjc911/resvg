@@ -48,13 +48,7 @@ const SCENARIOS: &[Scenario] = &[
     },
 ];
 
-const RESOLUTIONS: &[(u32, u32)] = &[
-    (200, 150),
-    (400, 300),
-    (600, 400),
-    (800, 600),
-    (1024, 768),
-];
+const RESOLUTIONS: &[(u32, u32)] = &[(200, 150), (400, 300), (600, 400), (800, 600), (1024, 768)];
 
 fn bench_turbulence(
     width: u32,

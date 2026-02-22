@@ -18,8 +18,8 @@
 // Run with:
 //   cargo run --release --example bench_morphology_comprehensive
 
-use resvg::filter::morphology;
 use resvg::filter::ImageRefMut;
+use resvg::filter::morphology;
 use rgb::RGBA8;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -309,7 +309,14 @@ fn main() {
     // 3. Subtle Erode: erode r=1, various sizes
     //    radius=1 -> 2x2=4 kernel -> always naive path (area < 9)
     // ------------------------------------------------------------------
-    for &(w, h) in &[(16, 16), (24, 24), (48, 48), (96, 96), (200, 150), (400, 300)] {
+    for &(w, h) in &[
+        (16, 16),
+        (24, 24),
+        (48, 48),
+        (96, 96),
+        (200, 150),
+        (400, 300),
+    ] {
         add(
             "Subtle Erode",
             w,
@@ -515,10 +522,7 @@ fn main() {
     );
     println!(
         "Faster (>1.05x): {}",
-        all_results
-            .iter()
-            .filter(|r| r.status == "FASTER")
-            .count()
+        all_results.iter().filter(|r| r.status == "FASTER").count()
     );
 
     if !regressions.is_empty() {
@@ -564,12 +568,8 @@ fn main() {
         }
         let faster = subset.iter().filter(|r| r.status == "FASTER").count();
         let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset
-            .iter()
-            .filter(|r| r.status == "REGRESSION")
-            .count();
-        let avg_speedup: f64 =
-            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
+        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
+        let avg_speedup: f64 = subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
         let min_speedup: f64 = subset
             .iter()
             .map(|r| r.speedup)
@@ -602,12 +602,8 @@ fn main() {
         }
         let faster = subset.iter().filter(|r| r.status == "FASTER").count();
         let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset
-            .iter()
-            .filter(|r| r.status == "REGRESSION")
-            .count();
-        let avg_speedup: f64 =
-            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
+        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
+        let avg_speedup: f64 = subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
         let min_speedup: f64 = subset
             .iter()
             .map(|r| r.speedup)
@@ -640,12 +636,8 @@ fn main() {
         }
         let faster = subset.iter().filter(|r| r.status == "FASTER").count();
         let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset
-            .iter()
-            .filter(|r| r.status == "REGRESSION")
-            .count();
-        let avg_speedup: f64 =
-            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
+        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
+        let avg_speedup: f64 = subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
         let min_speedup: f64 = subset
             .iter()
             .map(|r| r.speedup)
@@ -678,12 +670,8 @@ fn main() {
         }
         let faster = subset.iter().filter(|r| r.status == "FASTER").count();
         let same = subset.iter().filter(|r| r.status == "SAME").count();
-        let regress = subset
-            .iter()
-            .filter(|r| r.status == "REGRESSION")
-            .count();
-        let avg_speedup: f64 =
-            subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
+        let regress = subset.iter().filter(|r| r.status == "REGRESSION").count();
+        let avg_speedup: f64 = subset.iter().map(|r| r.speedup).sum::<f64>() / subset.len() as f64;
         let min_speedup: f64 = subset
             .iter()
             .map(|r| r.speedup)
@@ -724,13 +712,7 @@ fn main() {
         for r in &subset {
             println!(
                 "    {} {}: naive={:.2}us prod={:.2}us speedup={:.2}x [{}] ({})",
-                r.image_size,
-                r.operator,
-                r.naive_us,
-                r.prod_us,
-                r.speedup,
-                r.path,
-                r.status
+                r.image_size, r.operator, r.naive_us, r.prod_us, r.speedup, r.path, r.status
             );
         }
     }
