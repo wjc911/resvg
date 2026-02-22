@@ -133,7 +133,6 @@ fn gen_soft_blur(w: u32, h: u32) -> TestCase {
     }
 }
 
-
 fn gen_backdrop_blur(w: u32, h: u32) -> TestCase {
     let filter = r#"
     <filter id="f">
@@ -636,10 +635,7 @@ fn bench_one(case: &TestCase) -> f64 {
 
     if probe_ms >= SKIP_ITER_THRESHOLD_MS {
         // Degenerate case (e.g. huge-radius morphology): skip with probe as result.
-        eprintln!(
-            " [slow:{:.0}ms, skipping extra iters]",
-            probe_ms
-        );
+        eprintln!(" [slow:{:.0}ms, skipping extra iters]", probe_ms);
         return probe_ms;
     }
 
@@ -821,12 +817,7 @@ fn compare_results(baseline: &[BenchResult], optimized: &[BenchResult]) {
             }
 
             if speedup < 0.95 {
-                regressions.push((
-                    r.name.clone(),
-                    r.resolution.clone(),
-                    base_ms,
-                    r.median_ms,
-                ));
+                regressions.push((r.name.clone(), r.resolution.clone(), base_ms, r.median_ms));
             }
         }
     }
@@ -847,7 +838,10 @@ fn compare_results(baseline: &[BenchResult], optimized: &[BenchResult]) {
     }
 
     // Print existing SVG summary
-    eprintln!("\n=== Existing Test SVGs ({} files, 1x & 3x scale) ===\n", exist_1x_count.max(exist_3x_count));
+    eprintln!(
+        "\n=== Existing Test SVGs ({} files, 1x & 3x scale) ===\n",
+        exist_1x_count.max(exist_3x_count)
+    );
     if exist_1x_count > 0 {
         eprintln!("Total baseline (1x):  {:>10.3} ms", exist_1x_base);
         eprintln!("Total optimized (1x): {:>10.3} ms", exist_1x_opt);
@@ -989,11 +983,7 @@ fn main() {
             let res = format!("{}x{}", c.width, c.height);
             filter_set.contains(&(c.name.clone(), res))
         });
-        eprintln!(
-            "  --only filter: {} -> {} cases",
-            before,
-            all_cases.len()
-        );
+        eprintln!("  --only filter: {} -> {} cases", before, all_cases.len());
     }
 
     eprintln!(
