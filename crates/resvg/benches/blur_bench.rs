@@ -11,9 +11,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use rgb::ComponentSlice;
 use rgb::RGBA8;
-use std::cmp;
 use std::time::Instant;
 
 // ---- Inline the necessary types so the bench can call blur directly ----

@@ -48,14 +48,14 @@ struct BlurData {
 pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let pixel_count = (src.width as usize) * (src.height as usize);
 
-    // For large images, the interleaved 4-channel implementation has better
-    // cache locality and reduces 16 passes to 4. Use it as a cold early-return.
+    // For large images (>500k pixels), use the interleaved 4-channel
+    // implementation which has better cache locality by processing all RGBA
+    // channels simultaneously (4 passes instead of 16). Below this threshold
+    // the overhead of the f64x4 buffer allocation outweighs the cache benefit.
     if pixel_count > 500_000 {
         apply_interleaved(sigma_x, sigma_y, src);
         return;
     }
-
-    // Default hot path: original per-channel implementation.
     let buf_size = pixel_count;
     let mut buf = vec![0.0; buf_size];
     let buf = &mut buf;
@@ -165,12 +165,9 @@ fn gen_coefficients(sigma: f64, steps: usize) -> (f64, f64) {
 const IIR_VERT_TILE_W: usize = 32;
 
 /// Optimized IIR blur that processes all 4 RGBA channels simultaneously
-/// using `[f64; 4]` arrays and tiles the vertical pass for better cache
-/// locality. The `[f64; 4]` interleaved processing enables 4-channel SIMD
-/// within a pixel (potential AVX 256-bit), but IIR has strict serial
-/// dependency across pixels. The main win is reducing 16 passes to 4
-/// passes (4 channels simultaneously instead of separately).
-/// Uses f64 to stay bit-exact with the original implementation.
+/// using `[f64; 4]` arrays, reducing 16 data passes to 4. The vertical pass
+/// is tiled for cache locality. Uses f64 to stay bit-exact with the original
+/// per-channel implementation.
 #[cold]
 #[inline(never)]
 fn apply_interleaved(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
@@ -179,9 +176,6 @@ fn apply_interleaved(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let pixel_count = width * height;
     let steps = 4usize;
 
-    // Allocate interleaved f64 buffer: 4 channels per pixel.
-    // This processes all channels in a single pass instead of 4 separate passes,
-    // improving cache utilization by 4x.
     let mut buf = vec![[0.0f64; 4]; pixel_count];
 
     let data = src.data.as_mut_slice();

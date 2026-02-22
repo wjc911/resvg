@@ -33,6 +33,10 @@ pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
         .max()
         .unwrap_or(0);
 
+    // For large images with significant vertical blur radius, use a tiled
+    // implementation that processes columns in cache-friendly tiles.
+    // The threshold of 250k pixels and radius >= 8 was determined empirically:
+    // below these values the overhead of tiling outweighs the cache benefit.
     if pixel_count > 250_000 && max_radius_vert >= 8 {
         apply_tiled(&boxes_horz, &boxes_vert, &mut backbuf, &mut src);
         return;
@@ -45,6 +49,11 @@ pub fn apply(sigma_x: f64, sigma_y: f64, mut src: ImageRefMut) {
     }
 }
 
+/// Cold path for large images: uses tiled vertical pass and `[i32; 4]`
+/// accumulators for all 4 RGBA channels. Separated into its own function
+/// with `#[cold]` + `#[inline(never)]` so the compiler can optimize the
+/// default hot path (`box_blur_impl`) independently without bloating its
+/// instruction cache footprint.
 #[cold]
 #[inline(never)]
 fn apply_tiled(
@@ -358,11 +367,10 @@ fn box_blur_horz(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut Image
 /// Tile width for vertical pass. Chosen to keep working set in L1/L2 cache.
 const VERT_TILE_W: usize = 16;
 
-/// Optimized vertical box blur: processes columns in tiles for cache locality.
-/// The `[i32; 4]` accumulator enables 4-channel processing within a single
-/// iteration (potential 128-bit SIMD for the 4-channel arithmetic), but the
-/// loop-carried dependency on `val` prevents across-pixel vectorization.
-/// The main benefit is the cache-friendly tiled vertical pass.
+/// Optimized vertical box blur: processes columns in tiles of `VERT_TILE_W`
+/// for cache locality. The vertical pass scans memory with a stride of `width`,
+/// which causes frequent cache misses on large images. Tiling ensures that
+/// a narrow band of columns stays in L1/L2 cache across all rows.
 #[cold]
 #[inline(never)]
 fn box_blur_vert_tiled(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
@@ -395,6 +403,12 @@ fn box_blur_vert_tiled(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut
 }
 
 /// Process a single column with `[i32; 4]` accumulators for 4-channel processing.
+///
+/// `fv` and `lv` (first/last value) represent the boundary extension pixels.
+/// They are zero because the input uses premultiplied alpha, where pixels
+/// outside the image boundary are transparent black. The variables are kept
+/// (rather than inlining zero) to mirror the original algorithm's structure
+/// and make the boundary extension logic explicit.
 #[inline]
 fn box_blur_vert_single_col(
     blur_radius: usize,
@@ -410,7 +424,7 @@ fn box_blur_vert_single_col(
     let mut li = col;
     let mut ri = col + blur_radius * width;
 
-    let fv: [i32; 4] = [0; 4]; // default RGBA8 is all zeros
+    let fv: [i32; 4] = [0; 4];
     let lv: [i32; 4] = [0; 4];
 
     let blur_radius_next = blur_radius as i32 + 1;
@@ -509,9 +523,8 @@ fn box_blur_vert_single_col(
     }
 }
 
-/// Optimized horizontal box blur with `[i32; 4]` accumulators.
-/// The 4-channel arithmetic can use 128-bit SIMD within a pixel, but the
-/// loop-carried dependency on `val` prevents across-pixel vectorization.
+/// Horizontal box blur using `[i32; 4]` accumulators for 4-channel processing.
+/// Paired with `box_blur_vert_tiled` in the cold path for large images.
 #[cold]
 #[inline(never)]
 fn box_blur_horz_opt(blur_radius: usize, backbuf: &ImageRefMut, frontbuf: &mut ImageRefMut) {
