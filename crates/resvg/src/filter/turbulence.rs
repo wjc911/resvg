@@ -322,14 +322,19 @@ fn noise2_naive(
 // Optimized implementation
 // ---------------------------------------------------------------------------
 
-/// Flat gradient table: gradient_flat[channel][index] = [gx, gy]
-/// Stored as fixed-size arrays for cache-friendly access (no heap indirection).
+/// Pre-computed Perlin gradient vectors for all 4 color channels.
+///
+/// Uses fixed-size arrays instead of nested `Vec`s to eliminate heap
+/// indirection and improve cache locality during noise evaluation.
+/// Layout: `data[channel][lattice_index] = [gx, gy]`.
 struct GradientTable {
-    /// gradient[channel][lattice_index] = (gx, gy)
     data: [[[f64; 2]; B_LEN]; 4],
 }
 
-/// Optimized init: produces flat arrays instead of nested Vecs.
+/// Initialize the lattice selector and gradient table using flat arrays.
+///
+/// Marked `#[inline(never)]` because `GradientTable` is large (~16 KB on the
+/// stack); inlining would bloat the caller for a function called only once.
 #[inline(never)]
 fn init_optimized(mut seed: i32) -> ([usize; B_LEN], GradientTable) {
     let mut lattice_selector = [0usize; B_LEN];
@@ -383,8 +388,13 @@ fn init_optimized(mut seed: i32) -> ([usize; B_LEN], GradientTable) {
     (lattice_selector, gradient)
 }
 
-/// Compute noise for all 4 channels at once, sharing lattice lookups.
-/// Returns [channel0, channel1, channel2, channel3].
+/// Compute Perlin noise for all 4 color channels at a single point.
+///
+/// The naive implementation calls `noise2` once per channel, repeating the
+/// same lattice selector lookups and s-curve computations each time. This
+/// function performs those shared lookups once, then evaluates the
+/// channel-specific gradient dot products in a tight loop, cutting per-pixel
+/// overhead by roughly 4x for the lookup portion.
 #[inline]
 fn noise2_4ch(
     x: f64,
@@ -434,7 +444,6 @@ fn noise2_4ch(
     let sx = s_curve(rx0);
     let sy = s_curve(ry0);
 
-    // Process all 4 channels using the shared lattice points
     let mut result = [0.0f64; 4];
     for ch in 0..4 {
         let g = &gradient.data[ch];
@@ -453,8 +462,11 @@ fn noise2_4ch(
     result
 }
 
-/// Compute turbulence for all 4 channels at once for a single pixel.
-/// Returns [channel0, channel1, channel2, channel3].
+/// Compute turbulence/fractal-noise for all 4 channels at a single pixel.
+///
+/// Batches the per-octave noise evaluation across channels so that
+/// `noise2_4ch` can share lattice lookups. Uses `inv_ratio *= 0.5` instead
+/// of the naive `sum / ratio` to replace a division with a multiply per octave.
 #[inline]
 fn turbulence_4ch(
     mut x: f64,
@@ -496,6 +508,15 @@ fn turbulence_4ch(
     sums
 }
 
+/// Optimized turbulence implementation.
+///
+/// Key differences from the naive path:
+/// - `GradientTable` uses flat arrays instead of nested Vecs.
+/// - `noise2_4ch` evaluates all 4 channels per call, sharing lattice lookups.
+/// - Stitch-info base frequencies are pre-computed once, not per pixel.
+///
+/// Marked `#[inline(never)]` to keep the large function body out of `apply`,
+/// reducing instruction-cache pressure at the call site.
 #[inline(never)]
 fn apply_optimized(
     offset_x: f64,
@@ -723,116 +744,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Performance comparison test (run with --release --nocapture to see output).
-    #[test]
-    fn test_performance_comparison() {
-        use std::time::Instant;
-
-        let configs: &[(u32, u32, u32, bool, bool, &str)] = &[
-            (256, 256, 1, false, false, "256x256 oct=1 turb"),
-            (256, 256, 4, false, false, "256x256 oct=4 turb"),
-            (256, 256, 8, false, false, "256x256 oct=8 turb"),
-            (256, 256, 1, false, true, "256x256 oct=1 turb stitch"),
-            (256, 256, 4, false, true, "256x256 oct=4 turb stitch"),
-            (256, 256, 1, true, false, "256x256 oct=1 fractal"),
-            (256, 256, 4, true, false, "256x256 oct=4 fractal"),
-            (1024, 1024, 1, false, false, "1024x1024 oct=1 turb"),
-            (1024, 1024, 4, false, false, "1024x1024 oct=4 turb"),
-            (1024, 1024, 8, false, false, "1024x1024 oct=8 turb"),
-        ];
-
-        println!(
-            "\n{:<30} {:>12} {:>12} {:>8}",
-            "Config", "Naive (ms)", "Opt (ms)", "Speedup"
-        );
-        println!("{}", "-".repeat(65));
-
-        for &(w, h, octaves, fractal, stitch, label) in configs {
-            let iters = if w >= 1024 { 3 } else { 10 };
-
-            // Warm up naive
-            {
-                let mut buf = make_image(w, h);
-                apply_naive(
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    0.05,
-                    0.05,
-                    octaves,
-                    42,
-                    stitch,
-                    fractal,
-                    ImageRefMut::new(w, h, &mut buf),
-                );
-            }
-            let start = Instant::now();
-            for _ in 0..iters {
-                let mut buf = make_image(w, h);
-                apply_naive(
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    0.05,
-                    0.05,
-                    octaves,
-                    42,
-                    stitch,
-                    fractal,
-                    ImageRefMut::new(w, h, &mut buf),
-                );
-                std::hint::black_box(&buf);
-            }
-            let naive_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
-            // Warm up optimized
-            {
-                let mut buf = make_image(w, h);
-                apply_optimized(
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    0.05,
-                    0.05,
-                    octaves,
-                    42,
-                    stitch,
-                    fractal,
-                    ImageRefMut::new(w, h, &mut buf),
-                );
-            }
-            let start = Instant::now();
-            for _ in 0..iters {
-                let mut buf = make_image(w, h);
-                apply_optimized(
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    0.05,
-                    0.05,
-                    octaves,
-                    42,
-                    stitch,
-                    fractal,
-                    ImageRefMut::new(w, h, &mut buf),
-                );
-                std::hint::black_box(&buf);
-            }
-            let opt_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
-            let speedup = naive_ms / opt_ms;
-            println!(
-                "{:<30} {:>12.3} {:>12.3} {:>7.2}x",
-                label, naive_ms, opt_ms, speedup
-            );
-        }
-        println!();
     }
 
     /// Test with non-unit scale factors.
