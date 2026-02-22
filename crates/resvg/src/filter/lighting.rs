@@ -352,7 +352,15 @@ fn specular_lighting_optimized(
 
     // Helper to compute the light vector for point/spot lights (identical logic).
     #[inline(always)]
-    fn point_light_vector(src: ImageRef, nx: u32, ny: u32, lx: f32, ly: f32, lz: f32, surface_scale: f32) -> Vector3 {
+    fn point_light_vector(
+        src: ImageRef,
+        nx: u32,
+        ny: u32,
+        lx: f32,
+        ly: f32,
+        lz: f32,
+        surface_scale: f32,
+    ) -> Vector3 {
         let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
         let origin = Vector3::new(lx, ly, lz);
         let v = origin - Vector3::new(nx as f32, ny as f32, nz);
@@ -377,9 +385,17 @@ fn specular_lighting_optimized(
             macro_rules! calc_distant {
                 ($nx:expr, $ny:expr, $normal:expr) => {
                     write_pixel(
-                        &mut dest, $nx, $ny,
-                        light_vector, ls_ref, lighting_color, $normal,
-                        specular_exponent, specular_constant, exp_is_one, scale_factor,
+                        &mut dest,
+                        $nx,
+                        $ny,
+                        light_vector,
+                        ls_ref,
+                        lighting_color,
+                        $normal,
+                        specular_exponent,
+                        specular_constant,
+                        exp_is_one,
+                        scale_factor,
                     )
                 };
             }
@@ -411,9 +427,17 @@ fn specular_lighting_optimized(
                 ($nx:expr, $ny:expr, $normal:expr) => {{
                     let lv = point_light_vector(src, $nx, $ny, lx, ly, lz, surface_scale);
                     write_pixel(
-                        &mut dest, $nx, $ny,
-                        lv, ls_ref, lighting_color, $normal,
-                        specular_exponent, specular_constant, exp_is_one, scale_factor,
+                        &mut dest,
+                        $nx,
+                        $ny,
+                        lv,
+                        ls_ref,
+                        lighting_color,
+                        $normal,
+                        specular_exponent,
+                        specular_constant,
+                        exp_is_one,
+                        scale_factor,
                     )
                 }};
             }
@@ -445,9 +469,17 @@ fn specular_lighting_optimized(
                 ($nx:expr, $ny:expr, $normal:expr) => {{
                     let lv = point_light_vector(src, $nx, $ny, lx, ly, lz, surface_scale);
                     write_pixel(
-                        &mut dest, $nx, $ny,
-                        lv, ls_ref, lighting_color, $normal,
-                        specular_exponent, specular_constant, exp_is_one, scale_factor,
+                        &mut dest,
+                        $nx,
+                        $ny,
+                        lv,
+                        ls_ref,
+                        lighting_color,
+                        $normal,
+                        specular_exponent,
+                        specular_constant,
+                        exp_is_one,
+                        scale_factor,
                     )
                 }};
             }

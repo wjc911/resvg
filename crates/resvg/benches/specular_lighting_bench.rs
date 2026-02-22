@@ -47,13 +47,7 @@ fn main() {
     println!("feSpecularLighting Benchmark — Real-World Usage Patterns");
     println!("=========================================================\n");
 
-    let resolutions: &[(u32, u32)] = &[
-        (24, 24),
-        (48, 48),
-        (96, 96),
-        (200, 150),
-        (400, 300),
-    ];
+    let resolutions: &[(u32, u32)] = &[(24, 24), (48, 48), (96, 96), (200, 150), (400, 300)];
     let exponents: &[f32] = &[1.0, 5.0, 12.0, 20.0, 128.0];
     // PointLight listed first as it is the most common light source
     let light_types: &[&str] = &["point", "distant", "spot"];
@@ -68,11 +62,8 @@ fn main() {
         for &light_type in light_types {
             for &exponent in exponents {
                 let svg = make_svg(width, height, exponent, light_type);
-                let tree = resvg::usvg::Tree::from_str(
-                    &svg,
-                    &resvg::usvg::Options::default(),
-                )
-                .unwrap();
+                let tree =
+                    resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).unwrap();
 
                 // Warmup
                 for _ in 0..2 {
