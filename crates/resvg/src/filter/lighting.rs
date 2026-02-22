@@ -233,6 +233,7 @@ pub fn specular_lighting(
 /// while 256x256 is clearly faster. 128x128 is a conservative crossover point.
 const OPTIMIZED_THRESHOLD: u32 = 128 * 128;
 
+/// Dispatches to the naive or optimized lighting implementation based on image size.
 fn apply(
     light_source: LightSource,
     surface_scale: f32,
@@ -271,7 +272,7 @@ fn apply(
 }
 
 /// Original naive implementation used for small images (below `OPTIMIZED_THRESHOLD` pixels).
-/// Also used in test builds for bit-exact verification against the optimized path.
+/// Also serves as the correctness reference for tests that compare against the optimized path.
 #[cold]
 #[inline(never)]
 fn apply_naive(
@@ -283,9 +284,7 @@ fn apply_naive(
     src: ImageRef,
     mut dest: ImageRefMut,
 ) {
-    if src.width < 3 || src.height < 3 {
-        return;
-    }
+    // Note: the caller (`apply`) already guarantees src.width >= 3 && src.height >= 3.
 
     let width = src.width;
     let height = src.height;
@@ -433,9 +432,10 @@ fn apply_optimized(
         }
     }
 
-    // Helper: compute light color using pre-computed spot direction.
+    // Helper: compute light color, using the pre-computed spot direction to
+    // avoid re-normalizing the spot light direction vector on every pixel.
     #[inline(always)]
-    fn compute_light_color_opt(
+    fn compute_light_color(
         light_source: &LightSource,
         lighting_color: Color,
         light_vector: Vector3,
@@ -492,7 +492,7 @@ fn apply_optimized(
             px,
             py,
         );
-        let lc = compute_light_color_opt(light_source, lighting_color, lv, spot_direction);
+        let lc = compute_light_color(light_source, lighting_color, lv, spot_direction);
         let factor = light_factor(normal, lv);
 
         let compute = |x| (f32_bound(0.0, x as f32 * factor, 255.0) + 0.5) as u8;
