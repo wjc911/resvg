@@ -18,7 +18,8 @@ pub use tiny_skia;
 pub use usvg;
 
 mod clip;
-mod filter;
+#[doc(hidden)]
+pub mod filter;
 mod geom;
 mod image;
 mod mask;

@@ -234,6 +234,23 @@ pub struct ComponentTransfer {
 }
 
 impl ComponentTransfer {
+    /// Creates a new `ComponentTransfer` with the given transfer functions.
+    pub fn new(
+        input: Input,
+        func_r: TransferFunction,
+        func_g: TransferFunction,
+        func_b: TransferFunction,
+        func_a: TransferFunction,
+    ) -> Self {
+        ComponentTransfer {
+            input,
+            func_r,
+            func_g,
+            func_b,
+            func_a,
+        }
+    }
+
     /// Identifies input for the given filter primitive.
     ///
     /// `in` in the SVG.
@@ -352,6 +369,25 @@ pub struct ConvolveMatrix {
 }
 
 impl ConvolveMatrix {
+    /// Creates a new `ConvolveMatrix`.
+    pub fn new(
+        input: Input,
+        matrix: ConvolveMatrixData,
+        divisor: NonZeroF32,
+        bias: f32,
+        edge_mode: EdgeMode,
+        preserve_alpha: bool,
+    ) -> Self {
+        ConvolveMatrix {
+            input,
+            matrix,
+            divisor,
+            bias,
+            edge_mode,
+            preserve_alpha,
+        }
+    }
+
     /// Identifies input for the given filter primitive.
     ///
     /// `in` in the SVG.
@@ -448,7 +484,7 @@ impl ConvolveMatrixData {
     /// - `columns` * `rows` != `data.len()`
     /// - `target_x` >= `columns`
     /// - `target_y` >= `rows`
-    pub(crate) fn new(
+    pub fn new(
         target_x: u32,
         target_y: u32,
         columns: u32,
