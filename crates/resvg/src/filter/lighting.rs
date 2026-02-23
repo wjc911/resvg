@@ -184,6 +184,19 @@ pub fn specular_lighting(
 ) {
     assert!(src.width == dest.width && src.height == dest.height);
 
+    specular_lighting_optimized(fe, light_source, src, dest);
+}
+
+/// Original specular lighting implementation using the generic `apply()` path.
+/// Retained under `#[cfg(test)]` as the correctness reference for bit-exact
+/// comparison against the optimized version.
+#[cfg(test)]
+fn specular_lighting_naive(
+    fe: &SpecularLighting,
+    light_source: LightSource,
+    src: ImageRef,
+    dest: ImageRefMut,
+) {
     let light_factor = |normal: Normal, light_vector: Vector3| {
         let h = light_vector + Vector3::new(0.0, 0.0, 1.0);
         let h_length = h.length();
@@ -226,6 +239,271 @@ pub fn specular_lighting(
         src,
         dest,
     );
+}
+
+/// Optimized specular lighting implementation.
+///
+/// Key optimizations over the naive version:
+/// 1. **Devirtualization / inlining**: the specular factor computation is a
+///    monomorphized `#[inline] fn` instead of a `dyn Fn` trait-object closure
+///    passed through `apply()`. This lets LLVM inline and optimise the hot path
+///    without indirect-call overhead.
+/// 2. Specular-exponent == 1.0 boolean (`exp_is_one`) is hoisted out of the
+///    per-pixel loop so the branch predictor sees a loop-invariant condition.
+/// 3. `surface_scale / 255.0` is pre-computed once (`scale_factor`) instead of
+///    being recalculated for every pixel.
+///
+/// Note: this is *not* a SIMD or data-layout optimisation. The pixel data is
+/// still in AoS `RGBA8` order and the per-pixel branching prevents
+/// auto-vectorisation.
+fn specular_lighting_optimized(
+    fe: &SpecularLighting,
+    light_source: LightSource,
+    src: ImageRef,
+    mut dest: ImageRefMut,
+) {
+    if src.width < 3 || src.height < 3 {
+        return;
+    }
+
+    let width = src.width;
+    let height = src.height;
+    let surface_scale = fe.surface_scale();
+    let specular_exponent = fe.specular_exponent();
+    let specular_constant = fe.specular_constant();
+    let lighting_color = fe.lighting_color();
+    let exp_is_one = specular_exponent.approx_eq_ulps(&1.0, 4);
+    let scale_factor = surface_scale / 255.0;
+
+    #[inline(always)]
+    fn specular_factor(
+        normal: Normal,
+        light_vector: Vector3,
+        specular_exponent: f32,
+        specular_constant: f32,
+        exp_is_one: bool,
+        scale_factor: f32,
+    ) -> f32 {
+        let h = light_vector + Vector3::new(0.0, 0.0, 1.0);
+        let h_length = h.length();
+
+        if h_length.approx_zero_ulps(4) {
+            return 0.0;
+        }
+
+        let k = if normal.normal.approx_zero() {
+            let n_dot_h = h.z / h_length;
+            if exp_is_one {
+                n_dot_h
+            } else {
+                n_dot_h.powf(specular_exponent)
+            }
+        } else {
+            let mut n = normal.normal * scale_factor;
+            n.x *= normal.factor.x;
+            n.y *= normal.factor.y;
+
+            let normal = Vector3::new(n.x, n.y, 1.0);
+
+            let n_dot_h = normal.dot(&h) / normal.length() / h_length;
+            if exp_is_one {
+                n_dot_h
+            } else {
+                n_dot_h.powf(specular_exponent)
+            }
+        };
+
+        specular_constant * k
+    }
+
+    #[inline(always)]
+    fn write_pixel(
+        dest: &mut ImageRefMut,
+        nx: u32,
+        ny: u32,
+        light_vector: Vector3,
+        light_source: &LightSource,
+        lighting_color: Color,
+        normal: Normal,
+        specular_exponent: f32,
+        specular_constant: f32,
+        exp_is_one: bool,
+        scale_factor: f32,
+    ) {
+        let light_color = light_color(light_source, lighting_color, light_vector);
+        let factor = specular_factor(
+            normal,
+            light_vector,
+            specular_exponent,
+            specular_constant,
+            exp_is_one,
+            scale_factor,
+        );
+
+        let compute = |x| (f32_bound(0.0, x as f32 * factor, 255.0) + 0.5) as u8;
+
+        let r = compute(light_color.red);
+        let g = compute(light_color.green);
+        let b = compute(light_color.blue);
+        let a = calc_specular_alpha(r, g, b);
+
+        *dest.pixel_at_mut(nx, ny) = RGBA8 { b, g, r, a };
+    }
+
+    // Helper to compute the light vector for point/spot lights (identical logic).
+    #[inline(always)]
+    fn point_light_vector(
+        src: ImageRef,
+        nx: u32,
+        ny: u32,
+        lx: f32,
+        ly: f32,
+        lz: f32,
+        surface_scale: f32,
+    ) -> Vector3 {
+        let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
+        let origin = Vector3::new(lx, ly, lz);
+        let v = origin - Vector3::new(nx as f32, ny as f32, nz);
+        v.normalized().unwrap_or(v)
+    }
+
+    // Hoist the light-type match OUTSIDE the pixel loop so that each branch
+    // gets its own monomorphized inner loop.  This eliminates the per-pixel
+    // branch and lets LLVM reason about (and vectorise) each loop body
+    // independently.
+    match light_source {
+        LightSource::DistantLight(ref dl) => {
+            let azimuth = dl.azimuth.to_radians();
+            let elevation = dl.elevation.to_radians();
+            let light_vector = Vector3::new(
+                azimuth.cos() * elevation.cos(),
+                azimuth.sin() * elevation.cos(),
+                elevation.sin(),
+            );
+            let ls_ref = &light_source;
+
+            macro_rules! calc_distant {
+                ($nx:expr, $ny:expr, $normal:expr) => {
+                    write_pixel(
+                        &mut dest,
+                        $nx,
+                        $ny,
+                        light_vector,
+                        ls_ref,
+                        lighting_color,
+                        $normal,
+                        specular_exponent,
+                        specular_constant,
+                        exp_is_one,
+                        scale_factor,
+                    )
+                };
+            }
+
+            calc_distant!(0, 0, top_left_normal(src));
+            calc_distant!(width - 1, 0, top_right_normal(src));
+            calc_distant!(0, height - 1, bottom_left_normal(src));
+            calc_distant!(width - 1, height - 1, bottom_right_normal(src));
+
+            for x in 1..width - 1 {
+                calc_distant!(x, 0, top_row_normal(src, x));
+                calc_distant!(x, height - 1, bottom_row_normal(src, x));
+            }
+            for y in 1..height - 1 {
+                calc_distant!(0, y, left_column_normal(src, y));
+                calc_distant!(width - 1, y, right_column_normal(src, y));
+            }
+            for y in 1..height - 1 {
+                for x in 1..width - 1 {
+                    calc_distant!(x, y, interior_normal(src, x, y));
+                }
+            }
+        }
+        LightSource::PointLight(ref pl) => {
+            let (lx, ly, lz) = (pl.x, pl.y, pl.z);
+            let ls_ref = &light_source;
+
+            macro_rules! calc_point {
+                ($nx:expr, $ny:expr, $normal:expr) => {{
+                    let lv = point_light_vector(src, $nx, $ny, lx, ly, lz, surface_scale);
+                    write_pixel(
+                        &mut dest,
+                        $nx,
+                        $ny,
+                        lv,
+                        ls_ref,
+                        lighting_color,
+                        $normal,
+                        specular_exponent,
+                        specular_constant,
+                        exp_is_one,
+                        scale_factor,
+                    )
+                }};
+            }
+
+            calc_point!(0, 0, top_left_normal(src));
+            calc_point!(width - 1, 0, top_right_normal(src));
+            calc_point!(0, height - 1, bottom_left_normal(src));
+            calc_point!(width - 1, height - 1, bottom_right_normal(src));
+
+            for x in 1..width - 1 {
+                calc_point!(x, 0, top_row_normal(src, x));
+                calc_point!(x, height - 1, bottom_row_normal(src, x));
+            }
+            for y in 1..height - 1 {
+                calc_point!(0, y, left_column_normal(src, y));
+                calc_point!(width - 1, y, right_column_normal(src, y));
+            }
+            for y in 1..height - 1 {
+                for x in 1..width - 1 {
+                    calc_point!(x, y, interior_normal(src, x, y));
+                }
+            }
+        }
+        LightSource::SpotLight(ref sl) => {
+            let (lx, ly, lz) = (sl.x, sl.y, sl.z);
+            let ls_ref = &light_source;
+
+            macro_rules! calc_spot {
+                ($nx:expr, $ny:expr, $normal:expr) => {{
+                    let lv = point_light_vector(src, $nx, $ny, lx, ly, lz, surface_scale);
+                    write_pixel(
+                        &mut dest,
+                        $nx,
+                        $ny,
+                        lv,
+                        ls_ref,
+                        lighting_color,
+                        $normal,
+                        specular_exponent,
+                        specular_constant,
+                        exp_is_one,
+                        scale_factor,
+                    )
+                }};
+            }
+
+            calc_spot!(0, 0, top_left_normal(src));
+            calc_spot!(width - 1, 0, top_right_normal(src));
+            calc_spot!(0, height - 1, bottom_left_normal(src));
+            calc_spot!(width - 1, height - 1, bottom_right_normal(src));
+
+            for x in 1..width - 1 {
+                calc_spot!(x, 0, top_row_normal(src, x));
+                calc_spot!(x, height - 1, bottom_row_normal(src, x));
+            }
+            for y in 1..height - 1 {
+                calc_spot!(0, y, left_column_normal(src, y));
+                calc_spot!(width - 1, y, right_column_normal(src, y));
+            }
+            for y in 1..height - 1 {
+                for x in 1..width - 1 {
+                    calc_spot!(x, y, interior_normal(src, x, y));
+                }
+            }
+        }
+    }
 }
 
 fn apply(
@@ -486,4 +764,168 @@ fn calc_diffuse_alpha(_: u8, _: u8, _: u8) -> u8 {
 fn calc_specular_alpha(r: u8, g: u8, b: u8) -> u8 {
     use core::cmp::max;
     max(max(r, g), b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that the optimized specular lighting produces bit-exact results
+    /// by comparing naive vs optimized implementations through the internal API.
+    /// Since SpecularLighting fields are pub(crate) in usvg, we parse SVGs to
+    /// create the filter, then extract and call both implementations.
+    #[test]
+    fn test_specular_optimized_vs_naive_bit_exact() {
+        let sizes: &[(u32, u32)] = &[(4, 4), (16, 16), (64, 64), (100, 100)];
+        let exponents: &[f32] = &[1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 128.0];
+
+        let light_configs: Vec<(&str, &str)> = vec![
+            (
+                "distant_45_45",
+                r#"<feDistantLight azimuth="45" elevation="45"/>"#,
+            ),
+            (
+                "distant_0_90",
+                r#"<feDistantLight azimuth="0" elevation="90"/>"#,
+            ),
+            (
+                "point_50_50_100",
+                r#"<fePointLight x="50" y="50" z="100"/>"#,
+            ),
+            ("point_0_0_50", r#"<fePointLight x="0" y="0" z="50"/>"#),
+            (
+                "spot_basic",
+                r#"<feSpotLight x="50" y="50" z="100" pointsAtX="128" pointsAtY="128" pointsAtZ="0"/>"#,
+            ),
+            (
+                "spot_cone",
+                r#"<feSpotLight x="25" y="25" z="200" pointsAtX="50" pointsAtY="50" pointsAtZ="0" specularExponent="10" limitingConeAngle="30"/>"#,
+            ),
+        ];
+
+        fn make_test_image(width: u32, height: u32) -> Vec<RGBA8> {
+            let len = (width * height) as usize;
+            (0..len)
+                .map(|i| {
+                    let v = ((i * 37 + 13) % 256) as u8;
+                    RGBA8 {
+                        r: v,
+                        g: v,
+                        b: v,
+                        a: v,
+                    }
+                })
+                .collect()
+        }
+
+        for &(w, h) in sizes {
+            let src_data = make_test_image(w, h);
+
+            for &exp in exponents {
+                for &(name, light_xml) in &light_configs {
+                    let svg = format!(
+                        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">
+  <defs>
+    <filter id="f">
+      <feSpecularLighting in="SourceGraphic" surfaceScale="1"
+        specularConstant="1" specularExponent="{exp}"
+        lighting-color="white" result="spec">
+        {light_xml}
+      </feSpecularLighting>
+    </filter>
+  </defs>
+  <rect width="{w}" height="{h}" fill="gray" filter="url(#f)"/>
+</svg>"##,
+                    );
+
+                    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).unwrap();
+
+                    // Extract the SpecularLighting from the parsed tree.
+                    // Walk the tree to find the filter with specular lighting.
+                    let mut found = false;
+                    for node in tree.root().children() {
+                        if let usvg::Node::Group(group) = node {
+                            for filter in group.filters() {
+                                for primitive in filter.primitives() {
+                                    if let usvg::filter::Kind::SpecularLighting(fe) =
+                                        primitive.kind()
+                                    {
+                                        let light_source = fe.light_source();
+
+                                        // Run naive
+                                        let mut naive_dest = vec![
+                                            RGBA8 {
+                                                r: 0,
+                                                g: 0,
+                                                b: 0,
+                                                a: 0
+                                            };
+                                            (w * h) as usize
+                                        ];
+                                        specular_lighting_naive(
+                                            fe,
+                                            light_source,
+                                            ImageRef::new(w, h, &src_data),
+                                            ImageRefMut::new(w, h, &mut naive_dest),
+                                        );
+
+                                        // Run optimized
+                                        let mut opt_dest = vec![
+                                            RGBA8 {
+                                                r: 0,
+                                                g: 0,
+                                                b: 0,
+                                                a: 0
+                                            };
+                                            (w * h) as usize
+                                        ];
+                                        specular_lighting_optimized(
+                                            fe,
+                                            light_source,
+                                            ImageRef::new(w, h, &src_data),
+                                            ImageRefMut::new(w, h, &mut opt_dest),
+                                        );
+
+                                        // Compare byte-for-byte
+                                        for (idx, (n, o)) in
+                                            naive_dest.iter().zip(opt_dest.iter()).enumerate()
+                                        {
+                                            assert!(
+                                                n.r == o.r
+                                                    && n.g == o.g
+                                                    && n.b == o.b
+                                                    && n.a == o.a,
+                                                "Mismatch at pixel {} for {}x{} exp={} light={}: \
+                                                 naive=({},{},{},{}) opt=({},{},{},{})",
+                                                idx,
+                                                w,
+                                                h,
+                                                exp,
+                                                name,
+                                                n.r,
+                                                n.g,
+                                                n.b,
+                                                n.a,
+                                                o.r,
+                                                o.g,
+                                                o.b,
+                                                o.a,
+                                            );
+                                        }
+
+                                        found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert!(
+                        found,
+                        "Failed to find specular lighting for {}x{} exp={} light={}",
+                        w, h, exp, name
+                    );
+                }
+            }
+        }
+    }
 }
