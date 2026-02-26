@@ -15,7 +15,8 @@ mod convolve_matrix;
 mod displacement_map;
 mod iir_blur;
 mod lighting;
-mod morphology;
+#[doc(hidden)]
+pub mod morphology;
 mod turbulence;
 
 // TODO: apply single primitive filters in-place
